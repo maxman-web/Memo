@@ -3,6 +3,7 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
+import re
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.network import ConnectionTcpFull
@@ -45,9 +46,9 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION: Standard TCP with extended timeouts (Safe for Koyeb)
+# 🔄 CONNECTION
 bot = TelegramClient(
-    'mirror_bot_koyeb', 
+    'mirror_bot_koyeb_v45', 
     API_ID, 
     API_HASH, 
     connection=ConnectionTcpFull,
@@ -62,7 +63,7 @@ print("✅ Bot is Starting...")
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
 # ==========================================
 def fix_dood_link(link):
-    if not link: return "https://google.com"
+    if not link: return None
     bad_domains = ["dsvplay.com", "dood.re", "dood.wf", "dood.cx", "dood.sh", "dood.pm", "dood.to", "dood.so", "dood.la"]
     clean_link = link
     for domain in bad_domains:
@@ -221,11 +222,12 @@ async def start_handler(event):
     if AUTH_USERS and sender.id in AUTH_USERS:
         admin_guide = (
             "**👑 MAXCINEMA ADMIN GUIDE**\n\n"
-            "**1️⃣ MIRROR (Queued)**\nReply `/mirror name.mp4` to file.\n"
-            "• Links = Remote Upload\n"
-            "• Files = Vault + Doodstream\n\n"
-            "**2️⃣ POST PACK**\n`/postpack 100-107 Caption`\n\n"
-            "**3️⃣ FORCE SUB**\nStatus: " + ('Active' if FORCE_SUB_CHANNEL else 'Disabled')
+            "**1️⃣ MIRROR (Downloads & Uploads)**\nReply `/mirror name.mp4`\n"
+            "• Adds to Vault + Doodstream\n\n"
+            "**2️⃣ ADD (Instant Save)**\nReply `/add` to a video.\n"
+            "• Adds to Vault ONLY (No Rename/Download)\n\n"
+            "**3️⃣ POST**\nReply Photo + `/post` to the bot's completion message.\n"
+            "• Auto-detects if Doodstream exists."
         )
         await event.reply(admin_guide)
     else:
@@ -253,6 +255,30 @@ async def request_handler(event):
         await event.reply("✅ **Request Sent!**")
     except Exception as e:
         await event.reply(f"❌ Error sending request: {e}")
+
+# 🆕 NEW: /add COMMAND (Instant Save)
+@bot.on(events.NewMessage(pattern='/add'))
+async def add_handler(event):
+    sender = await event.get_sender()
+    if not AUTH_USERS or sender.id not in AUTH_USERS: return
+    reply = await event.get_reply_message()
+    if not reply or not reply.media: return await event.reply("❌ Please reply to a video or file.")
+
+    try:
+        # Instant forwarding (No download needed)
+        # We reuse the original caption if it exists
+        original_caption = reply.text or ""
+        vault_msg = await bot.send_file(DB_CHANNEL_ID, reply.media, caption=original_caption)
+        
+        msg = (
+            f"✅ **File Added to DB!**\n\n"
+            f"📂 **Vault ID:** {vault_msg.id}\n"
+            f"🔗 **Doodstream:** N/A\n\n"
+            f"👇 Reply with Photo + `/post` to publish."
+        )
+        await event.reply(msg)
+    except Exception as e:
+        await event.reply(f"❌ Error Adding: {e}")
 
 @bot.on(events.NewMessage(pattern='/postpack'))
 async def postpack_handler(event):
@@ -322,20 +348,28 @@ async def post_handler(event):
     if dood_link: caption = caption.replace(dood_link, "")
     caption = caption.strip() or "🎬 **New Movie Uploaded!**"
 
-    web_url = fix_dood_link(dood_link) if dood_link else "https://google.com"
+    web_url = fix_dood_link(dood_link) if dood_link else None
     me = await bot.get_me()
     deep_link = f"https://t.me/{me.username}?start={vault_id}"
     
-    buttons = [[Button.url("☁️ Stream (Now)", url=web_url)]]
-    buttons.append([Button.url("📂 Get File", url=deep_link)])
+    buttons = []
     
-    if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
+    # LOGIC: SMART BUTTONS
+    if web_url:
+        # Case 1: Doodstream Link Exists -> Show 3 Buttons (Stream + File + Website)
+        buttons.append([Button.url("☁️ Stream (Now)", url=web_url)])
+        buttons.append([Button.url("📂 Get File", url=deep_link)])
+        if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
+    else:
+        # Case 2: No Doodstream (Added via /add) -> Show 2 Buttons (Website + File)
+        if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
+        buttons.append([Button.url("📂 Get File", url=deep_link)])
 
     poster = await event.download_media() if event.photo else None
     try:
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
-        await event.reply(f"✅ Published!\n🔗 **Link:** {web_url}")
+        await event.reply(f"✅ Published!\nButtons added: {len(buttons[0]) if buttons else 0}")
     except Exception as e: await event.reply(f"❌ Error: {e}")
 
 # ==========================================
