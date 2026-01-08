@@ -494,7 +494,13 @@ async def start_web_server():
     ])
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", 7860).start()
+    
+    # 👇 This makes your bot listen to the CORRECT port automatically
+    port = int(os.environ.get("PORT", 8080)) 
+    
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    print(f"✅ Web Server Started on Port {port}")
+
 
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
@@ -502,3 +508,4 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
