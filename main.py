@@ -48,7 +48,7 @@ API_ID = int(str_api_id)
 
 # 🔄 CONNECTION
 bot = TelegramClient(
-    'mirror_bot_koyeb_v45', 
+    'mirror_bot_koyeb_v46', 
     API_ID, 
     API_HASH, 
     connection=ConnectionTcpFull,
@@ -222,12 +222,13 @@ async def start_handler(event):
     if AUTH_USERS and sender.id in AUTH_USERS:
         admin_guide = (
             "**👑 MAXCINEMA ADMIN GUIDE**\n\n"
-            "**1️⃣ MIRROR (Downloads & Uploads)**\nReply `/mirror name.mp4`\n"
+            "**1️⃣ MIRROR (Full)**\nReply `/mirror name.mp4`\n"
             "• Adds to Vault + Doodstream\n\n"
-            "**2️⃣ ADD (Instant Save)**\nReply `/add` to a video.\n"
-            "• Adds to Vault ONLY (No Rename/Download)\n\n"
-            "**3️⃣ POST**\nReply Photo + `/post` to the bot's completion message.\n"
-            "• Auto-detects if Doodstream exists."
+            "**2️⃣ ADD (Instant)**\nReply `/add` to a video.\n"
+            "• Adds to Vault ONLY.\n\n"
+            "**3️⃣ POST (Auto)**\nReply Photo + `/post` to a bot message.\n\n"
+            "**4️⃣ POST ID (Manual)**\nPhoto Caption: `/postid 1234 Caption...`\n"
+            "• Posts ID 1234 directly to channel."
         )
         await event.reply(admin_guide)
     else:
@@ -256,7 +257,7 @@ async def request_handler(event):
     except Exception as e:
         await event.reply(f"❌ Error sending request: {e}")
 
-# 🆕 NEW: /add COMMAND (Instant Save)
+# 🆕 COMMAND 1: /add (Instant Save)
 @bot.on(events.NewMessage(pattern='/add'))
 async def add_handler(event):
     sender = await event.get_sender()
@@ -265,11 +266,8 @@ async def add_handler(event):
     if not reply or not reply.media: return await event.reply("❌ Please reply to a video or file.")
 
     try:
-        # Instant forwarding (No download needed)
-        # We reuse the original caption if it exists
         original_caption = reply.text or ""
         vault_msg = await bot.send_file(DB_CHANNEL_ID, reply.media, caption=original_caption)
-        
         msg = (
             f"✅ **File Added to DB!**\n\n"
             f"📂 **Vault ID:** {vault_msg.id}\n"
@@ -279,6 +277,48 @@ async def add_handler(event):
         await event.reply(msg)
     except Exception as e:
         await event.reply(f"❌ Error Adding: {e}")
+
+# 🆕 COMMAND 2: /postid (Manual Post by ID)
+@bot.on(events.NewMessage(pattern='/postid'))
+async def postid_handler(event):
+    sender = await event.get_sender()
+    if not AUTH_USERS or sender.id not in AUTH_USERS: return
+    
+    # Expected Format: /postid 1055 This is the caption
+    args = event.text.split(' ', 2)
+    
+    if len(args) < 3: 
+        return await event.reply("❌ **Usage:** Send Photo with caption:\n`/postid 1234 Your Movie Caption`")
+    
+    try:
+        vault_id = int(args[1])
+        caption = args[2]
+    except:
+        return await event.reply("❌ **Error:** ID must be a number.\nEx: `/postid 1055 Caption`")
+
+    # Generate Buttons
+    me = await bot.get_me()
+    deep_link = f"https://t.me/{me.username}?start={vault_id}"
+    
+    buttons = []
+    if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
+    buttons.append([Button.url("📂 Get File", url=deep_link)])
+
+    # Get Poster from the message itself or reply
+    poster = await event.download_media() if event.photo else None
+    
+    if not poster:
+        reply = await event.get_reply_message()
+        if reply and reply.photo:
+            poster = await reply.download_media()
+
+    try:
+        await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
+        if poster: os.remove(poster)
+        await event.reply(f"✅ **Published Manually!**\n🆔 Vault ID: {vault_id}")
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
 
 @bot.on(events.NewMessage(pattern='/postpack'))
 async def postpack_handler(event):
@@ -319,6 +359,8 @@ async def postpack_handler(event):
 @bot.on(events.NewMessage(pattern='/post'))
 async def post_handler(event):
     if "/postpack" in event.text: return 
+    if "/postid" in event.text: return
+    
     sender = await event.get_sender()
     if not AUTH_USERS or sender.id not in AUTH_USERS: return 
     reply = await event.get_reply_message()
@@ -353,15 +395,11 @@ async def post_handler(event):
     deep_link = f"https://t.me/{me.username}?start={vault_id}"
     
     buttons = []
-    
-    # LOGIC: SMART BUTTONS
     if web_url:
-        # Case 1: Doodstream Link Exists -> Show 3 Buttons (Stream + File + Website)
         buttons.append([Button.url("☁️ Stream (Now)", url=web_url)])
         buttons.append([Button.url("📂 Get File", url=deep_link)])
         if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
     else:
-        # Case 2: No Doodstream (Added via /add) -> Show 2 Buttons (Website + File)
         if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
         buttons.append([Button.url("📂 Get File", url=deep_link)])
 
@@ -508,4 +546,3 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
-
