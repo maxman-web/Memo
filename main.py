@@ -7,6 +7,7 @@ import re
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.network import ConnectionTcpIntermediate
+
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
@@ -45,19 +46,18 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION (STANDARD FOR RENDER)
+# 🔄 CONNECTION (OPTIMIZED FOR RENDER)
 bot = TelegramClient(
-    'MaxCinema_Mirror_Render',  # 👈 Fresh Session Name
+    'MaxCinema_Render_Session', 
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpIntermediate, # 👈 Best mode for Docker
-    timeout=60,          
+    connection=ConnectionTcpIntermediate, # 👈 Best for Docker
+    timeout=120,          
     request_retries=10, 
     retry_delay=5        
 )
 
 print("✅ Bot is Starting...")
-
 
 # ==========================================
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
@@ -428,7 +428,8 @@ async def process_task(event, source, name, thumb_path):
                         total = int(resp.headers.get('content-length', 0))
                         current = 0
                         async with aiofiles.open(name, mode='wb') as f:
-                            async for chunk in resp.content.iter_chunked(4 * 1024 * 1024): 
+                            # 👇 CHANGED CHUNK SIZE TO 10MB (Speed Hack for Render)
+                            async for chunk in resp.content.iter_chunked(10 * 1024 * 1024): 
                                 await f.write(chunk)
                                 current += len(chunk)
                                 await progress_bar(current, total, status_msg, "⬇️ **Downloading...**", last_time)
@@ -533,9 +534,9 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # 👇 CHANGE THIS LINE
-    # Hugging Face expects Port 7860
-    port = int(os.environ.get("PORT", 7860)) 
+    # 👇 CHANGE THIS LINE FOR RENDER
+    # Render assigns a random port, usually stored in 'PORT' env var.
+    port = int(os.environ.get("PORT", 10000)) 
     
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web Server Started on Port {port}")
@@ -547,11 +548,3 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
-
-
-
-
-
-
-
-
