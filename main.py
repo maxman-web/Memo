@@ -6,7 +6,7 @@ import aiofiles
 import re
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
-from telethon.network import ConnectionTcpObfuscated
+from telethon.network import ConnectionTcpIntermediate
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
@@ -45,14 +45,13 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION (STEALTH MODE)
+# 🔄 CONNECTION (STANDARD FOR RENDER)
 bot = TelegramClient(
-    'MaxCinema_Mirror_Session_Final', # 👈 New Name
+    'MaxCinema_Mirror_Render',  # 👈 Fresh Session Name
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpObfuscated, # 👈 The "Disguise" Mode
-    use_ipv6=False,      # 👈 Force IPv4
-    timeout=120,          
+    connection=ConnectionTcpIntermediate, # 👈 Best mode for Docker
+    timeout=60,          
     request_retries=10, 
     retry_delay=5        
 )
@@ -547,6 +546,7 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
 
 
