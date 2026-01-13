@@ -58,6 +58,7 @@ bot = TelegramClient(
 
 print("✅ Bot is Starting...")
 
+
 # ==========================================
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
 # ==========================================
@@ -546,6 +547,7 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
 
 
