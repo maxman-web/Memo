@@ -46,15 +46,16 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION
+# 🔄 CONNECTION (UPDATED)
 bot = TelegramClient(
-    'mirror_bot_koyeb_v46', 
+    'MaxCinema_Mirror_Session_01',  # 👈 New Name
     API_ID, 
     API_HASH, 
-    #connection=ConnectionTcpFull,
-    timeout=60,         
+    system_version="4.16.30-vxCUSTOM", # 👈 Makes bot look legitimate
+    device_model="MaxCinema Server",   # 👈 Custom Device Name
+    timeout=60,          
     request_retries=10, 
-    retry_delay=5       
+    retry_delay=5        
 )
 
 print("✅ Bot is Starting...")
@@ -547,5 +548,6 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
 
