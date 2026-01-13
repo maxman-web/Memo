@@ -533,8 +533,9 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # 👇 This makes your bot listen to the CORRECT port automatically
-    port = int(os.environ.get("PORT", 8080)) 
+    # 👇 CHANGE THIS LINE
+    # Hugging Face expects Port 7860
+    port = int(os.environ.get("PORT", 7860)) 
     
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web Server Started on Port {port}")
@@ -546,3 +547,4 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
