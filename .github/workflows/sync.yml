@@ -18,4 +18,4 @@ jobs:
           # 👇 REPLACE WITH YOUR DETAILS
           HF_USERNAME: "Maxxcinema" 
           SPACE_NAME: "mymirror" 
-        run: git push https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$SPACE_NAME main
+        run: git push --force https://$HF_USERNAME:$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$SPACE_NAME main
