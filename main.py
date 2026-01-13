@@ -6,7 +6,7 @@ import aiofiles
 import re
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
-from telethon.network import ConnectionTcpIntermediate
+from telethon.network import ConnectionTcpAbridged
 
 # ==========================================
 # ⚙️ CONFIGURATION
@@ -46,15 +46,14 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION (FINAL FIX)
+# 🔄 CONNECTION (IPv4 FORCE FIX)
 bot = TelegramClient(
-    'MaxCinema_Mirror_Session_02',  # 👈 Changed name again to force fresh start
+    'MaxCinema_Mirror_Session_03',  # 👈 New Session
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpIntermediate, # 👈 The Magic Line
-    system_version="4.16.30-vxCUSTOM",
-    device_model="MaxCinema Server",
-    timeout=120,          # 👈 Increased to 120 seconds
+    connection=ConnectionTcpAbridged, # 👈 Smallest/Fastest mode
+    use_ipv6=False,      # 👈 FORCE IPv4 (Critical for Hugging Face)
+    timeout=120,          
     request_retries=10, 
     retry_delay=5        
 )
@@ -549,6 +548,7 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
 
 
