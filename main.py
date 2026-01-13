@@ -6,8 +6,7 @@ import aiofiles
 import re
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
-from telethon.network import ConnectionTcpAbridged
-
+from telethon.network import ConnectionTcpObfuscated
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
@@ -46,13 +45,13 @@ if not str_api_id:
 
 API_ID = int(str_api_id)
 
-# 🔄 CONNECTION (IPv4 FORCE FIX)
+# 🔄 CONNECTION (STEALTH MODE)
 bot = TelegramClient(
-    'MaxCinema_Mirror_Session_03',  # 👈 New Session
+    'MaxCinema_Mirror_Session_Final', # 👈 New Name
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpAbridged, # 👈 Smallest/Fastest mode
-    use_ipv6=False,      # 👈 FORCE IPv4 (Critical for Hugging Face)
+    connection=ConnectionTcpObfuscated, # 👈 The "Disguise" Mode
+    use_ipv6=False,      # 👈 Force IPv4
     timeout=120,          
     request_retries=10, 
     retry_delay=5        
@@ -548,6 +547,7 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
 
 
