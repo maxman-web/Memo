@@ -51,7 +51,7 @@ bot = TelegramClient(
     'mirror_bot_koyeb_v46', 
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpFull,
+    #connection=ConnectionTcpFull,
     timeout=60,         
     request_retries=10, 
     retry_delay=5       
@@ -547,4 +547,5 @@ if __name__ == '__main__':
     bot.loop.create_task(worker())
     bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
+
 
