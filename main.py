@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 import aiofiles
 import re
+import sqlite3
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.network import ConnectionTcpIntermediate
@@ -18,13 +19,14 @@ DOOD_KEY = os.environ.get("DOOD_KEY", "").strip()
 WEBSITE_HOME = os.environ.get("WEBSITE_HOME", "").strip()
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip()
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip('/')
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip() # 🆕 TMDB API Key
 
 # 🔐 SECURITY & FORCE SUB
 auth_str = os.environ.get("AUTH_USERS", "").strip()
 AUTH_USERS = [int(x) for x in auth_str.split(',') if x.strip().isdigit()]
 FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "").strip()
 
-if FORCE_SUB_CHANNEL.replace('-','').isdigit():
+if FORCE_SUB_CHANNEL.replace('-', '').isdigit():
     FORCE_SUB_CHANNEL = int(FORCE_SUB_CHANNEL)
 
 # 🚦 GLOBAL QUEUE MANAGER
@@ -35,7 +37,7 @@ def parse_id(val):
     if not val: return 0
     if val.startswith("@"): return val
     try: return int(val)
-    except: return 0
+    except ValueError: return 0
 
 DB_CHANNEL_ID = parse_id(os.environ.get("DB_CHANNEL_ID", "0"))
 PUBLIC_CHANNEL_ID = parse_id(os.environ.get("PUBLIC_CHANNEL_ID", "0"))
@@ -51,13 +53,32 @@ bot = TelegramClient(
     'MaxCinema_Render_Session', 
     API_ID, 
     API_HASH, 
-    connection=ConnectionTcpIntermediate, # 👈 Best for Docker
+    connection=ConnectionTcpIntermediate, 
     timeout=120,          
     request_retries=10, 
     retry_delay=5        
 )
 
 print("✅ Bot is Starting...")
+
+# ==========================================
+# 💾 DATABASE (USERS & ANALYTICS)
+# ==========================================
+conn = sqlite3.connect('bot_users.db', check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+conn.commit()
+
+def add_user(user_id):
+    try:
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+    except Exception as e:
+        print(f"DB Error: {e}")
+
+def get_all_users():
+    cursor.execute("SELECT user_id FROM users")
+    return [row[0] for row in cursor.fetchall()]
 
 # ==========================================
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
@@ -81,24 +102,16 @@ async def check_subscription(user_id):
     if not FORCE_SUB_CHANNEL: return True
     if user_id in AUTH_USERS: return True
     try:
-        participant = await bot(functions.channels.GetParticipantRequest(
+        await bot(functions.channels.GetParticipantRequest(
             channel=FORCE_SUB_CHANNEL,
             participant=user_id
         ))
         return True
-    except:
+    except Exception:
         return False
 
 # ==========================================
-# 🛠️ MEMORY REFRESHER
-# ==========================================
-async def refresh_cache():
-    try:
-        async for dialog in bot.iter_dialogs(limit=20): pass 
-    except: pass
-
-# ==========================================
-# 🚦 QUEUE WORKER
+# 🚦 QUEUE WORKER (WITH MEMORY LEAK FIX)
 # ==========================================
 async def worker():
     print("👷 Queue Worker Started")
@@ -109,6 +122,9 @@ async def worker():
             await process_task(event, source, name, thumb_path)
         except Exception as e:
             print(f"Task Failed: {e}")
+            try:
+                await event.reply(f"❌ Task Failed: {str(e)}")
+            except Exception: pass
         finally:
             WORK_QUEUE.task_done()
             await asyncio.sleep(2)
@@ -125,7 +141,7 @@ async def progress_bar(current, total, status_msg, action_name, last_time_ref):
     try:
         await status_msg.edit(f"{action_name}\n{bar} **{percentage:.1f}%**")
         last_time_ref[0] = now
-    except: pass
+    except Exception: pass
 
 # ==========================================
 # 🧠 SMART DOWNLOADER
@@ -134,23 +150,16 @@ async def smart_download(client, message, filename, progress_callback):
     try:
         await client.download_media(message, file=filename, progress_callback=progress_callback)
         return True
-    except: pass
+    except Exception: pass
     try:
         if hasattr(message, 'media') and hasattr(message.media, 'document'):
             await client.download_media(message.media.document, file=filename, progress_callback=progress_callback)
             return True
-    except: pass
-    try:
-        if isinstance(DB_CHANNEL_ID, int) and DB_CHANNEL_ID != 0:
-            vault_msg = await client.send_file(DB_CHANNEL_ID, message.media, caption="🔄 Processing...")
-            await client.download_media(vault_msg, file=filename, progress_callback=progress_callback)
-            await vault_msg.delete()
-            return True
-    except: pass
+    except Exception: pass
     return False
 
 # ==========================================
-# 🌐 WEB SERVER
+# 🌐 WEB SERVER (WITH VIDEO SEEKING FIX)
 # ==========================================
 async def stream_handler(request):
     try:
@@ -167,14 +176,45 @@ async def stream_handler(request):
         file_size = message.document.size
         mime_type = message.document.mime_type or "application/octet-stream"
 
-        response = web.StreamResponse()
+        # Handle HTTP Range Requests (Allows seeking in video player)
+        range_header = request.headers.get('Range')
+        start = 0
+        end = file_size - 1
+
+        if range_header:
+            match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+            if match:
+                start = int(match.group(1))
+                if match.group(2):
+                    end = int(match.group(2))
+
+        response = web.StreamResponse(status=206 if range_header else 200)
         response.headers['Content-Type'] = mime_type
-        response.headers['Content-Disposition'] = f'attachment; filename="{file_name}"'
-        response.content_length = file_size
+        response.headers['Accept-Ranges'] = 'bytes'
+        response.headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+        response.headers['Content-Disposition'] = f'inline; filename="{file_name}"'
+        response.content_length = (end - start) + 1
         
         await response.prepare(request)
-        async for chunk in bot.iter_download(message.media):
-            await response.write(chunk)    
+
+        # Download chunks and yield to browser
+        offset_limit = 1048576 # 1MB chunks
+        chunk_start = start - (start % offset_limit)
+        
+        async for chunk in bot.iter_download(message.media, offset=chunk_start):
+            if chunk_start < start:
+                slice_start = start - chunk_start
+                chunk = chunk[slice_start:]
+                chunk_start = start
+            
+            if len(chunk) > response.content_length:
+                chunk = chunk[:response.content_length]
+
+            await response.write(chunk)
+            response.content_length -= len(chunk)
+            if response.content_length <= 0:
+                break
+
         return response
     except Exception as e:
         return web.Response(status=500, text=str(e))
@@ -188,6 +228,7 @@ async def root_handler(request):
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     sender = await event.get_sender()
+    add_user(sender.id) # 🆕 Save user to DB
     args = event.text.split()
     is_joined = await check_subscription(sender.id)
     
@@ -199,36 +240,41 @@ async def start_handler(event):
                    [Button.url("🔄 Try Again", url=f"https://t.me/{event.client.me.username}?start={param}")] ]
             return await event.reply(msg, buttons=btn)
             
-        await event.reply("📂 **Fetching your files...**")
+        status = await event.reply("📂 **Fetching your files...**")
         if "pack_" in param:
             try:
                 _, start_id, end_id = param.split('_')
-                start_id = int(start_id)
-                end_id = int(end_id)
-                ids_to_fetch = list(range(start_id, end_id + 1))
-                chunk_size = 20
-                for i in range(0, len(ids_to_fetch), chunk_size):
-                    chunk = ids_to_fetch[i : i + chunk_size]
-                    await bot.forward_messages(event.chat_id, chunk, DB_CHANNEL_ID)
-                    await asyncio.sleep(1)
-            except: await event.reply("❌ Pack not found.")
+                ids_to_fetch = list(range(int(start_id), int(end_id) + 1))
+                messages = await bot.get_messages(DB_CHANNEL_ID, ids=ids_to_fetch)
+                for msg in messages:
+                    if msg and msg.media:
+                        # 🆕 Secure Copy (No Forward Tag)
+                        await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                await status.delete()
+            except Exception: await status.edit("❌ Pack not found.")
         else:
             try:
                 msg_id = int(param)
-                await bot.forward_messages(event.chat_id, msg_id, DB_CHANNEL_ID)
-            except: await event.reply("❌ File not found.")
+                msg = await bot.get_messages(DB_CHANNEL_ID, ids=msg_id)
+                if msg and msg.media:
+                    # 🆕 Secure Copy (No Forward Tag)
+                    await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    await status.delete()
+                else:
+                    await status.edit("❌ File not found.")
+            except Exception: await status.edit("❌ Error processing file.")
         return
 
     if AUTH_USERS and sender.id in AUTH_USERS:
         admin_guide = (
             "**👑 MAXCINEMA ADMIN GUIDE**\n\n"
             "**1️⃣ MIRROR (Full)**\nReply `/mirror name.mp4`\n"
-            "• Adds to Vault + Doodstream\n\n"
             "**2️⃣ ADD (Instant)**\nReply `/add` to a video.\n"
-            "• Adds to Vault ONLY.\n\n"
-            "**3️⃣ POST (Auto)**\nReply Photo + `/post` to a bot message.\n\n"
+            "**3️⃣ POST (Auto)**\nReply Photo + `/post` to a bot message.\n"
             "**4️⃣ POST ID (Manual)**\nPhoto Caption: `/postid 1234 Caption...`\n"
-            "• Posts ID 1234 directly to channel."
+            "**5️⃣ TMDB**\n`/tmdb Inception` to get movie details.\n"
+            "**6️⃣ BROADCAST**\n`/broadcast Message` to message all users.\n"
+            "**7️⃣ STATS**\n`/stats` to view DB users."
         )
         await event.reply(admin_guide)
     else:
@@ -242,22 +288,106 @@ async def start_handler(event):
 async def callback_handler(event):
     await event.answer("💡 TYPE:\n/request Name", alert=True)
 
+# 🆕 AUTO DB SEARCH REQUEST
 @bot.on(events.NewMessage(pattern='/request'))
 async def request_handler(event):
     query = event.text.replace("/request", "").strip()
     sender = await event.get_sender()
-    if not query: return await event.reply("❌ Usage: `/request Name`")
-    if not AUTH_USERS: return await event.reply("❌ No Admins.")
+    
+    if not query: 
+        return await event.reply("❌ Usage: `/request Movie Name`")
+    
+    status = await event.reply(f"🔍 Searching Vault for `{query}`...")
+    found = False
+    
     try:
-        for admin_id in AUTH_USERS:
-            try:
-                await bot.send_message(admin_id, f"📩 **NEW REQUEST!**\n👤 {sender.first_name}\n📝 `{query}`")
-            except: continue
-        await event.reply("✅ **Request Sent!**")
-    except Exception as e:
-        await event.reply(f"❌ Error sending request: {e}")
+        # 1. Search the DB Channel 
+        async for msg in bot.iter_messages(DB_CHANNEL_ID, search=query, limit=3):
+            if msg.media:
+                await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                found = True
+        
+        if found:
+            return await status.edit("✅ **Here is what I found!**")
 
-# 🆕 COMMAND 1: /add (Instant Save)
+        # 2. If not found, send request to Admins
+        await status.edit("⚠️ Not found in database. Forwarding request to admins...")
+        if AUTH_USERS:
+            for admin_id in AUTH_USERS:
+                try:
+                    await bot.send_message(admin_id, f"📩 **NEW REQUEST!**\n👤 {sender.first_name} (`{sender.id}`)\n📝 `{query}`")
+                except Exception: continue
+            await event.reply("✅ **Request Sent to Admins!**")
+    except Exception as e:
+        await status.edit(f"❌ Error searching: {str(e)}")
+
+# 🆕 ADMIN: BROADCAST & STATS
+@bot.on(events.NewMessage(pattern='/stats'))
+async def stats_handler(event):
+    if event.sender_id not in AUTH_USERS: return
+    users = get_all_users()
+    await event.reply(f"📊 **Bot Statistics**\n\n👥 Total Users: **{len(users)}**")
+
+@bot.on(events.NewMessage(pattern='/broadcast'))
+async def broadcast_handler(event):
+    if event.sender_id not in AUTH_USERS: return
+    msg = event.text.replace("/broadcast", "").strip()
+    if not msg: return await event.reply("❌ Usage: `/broadcast Hello everyone!`")
+    
+    users = get_all_users()
+    sent = 0
+    status = await event.reply(f"🚀 Broadcasting to {len(users)} users...")
+    
+    for user in users:
+        try:
+            await bot.send_message(user, msg)
+            sent += 1
+            await asyncio.sleep(0.1) # Prevent flood wait
+        except Exception: pass
+        
+    await status.edit(f"✅ **Broadcast Complete!**\nDelivered to: {sent}/{len(users)}")
+
+# 🆕 ADMIN: FETCH TMDB METADATA
+@bot.on(events.NewMessage(pattern='/tmdb'))
+async def tmdb_handler(event):
+    if event.sender_id not in AUTH_USERS: return
+    query = event.text.replace("/tmdb", "").strip()
+    if not query: return await event.reply("❌ Usage: `/tmdb Inception`")
+    if not TMDB_API_KEY: return await event.reply("❌ TMDB_API_KEY is missing in ENV.")
+    
+    status = await event.reply("🔍 Fetching from TMDB...")
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
+            async with session.get(url) as r:
+                data = await r.json()
+                
+            if not data.get('results'):
+                return await status.edit("❌ Movie not found.")
+                
+            movie = data['results'][0]
+            title = movie.get('title')
+            year = movie.get('release_date', '').split('-')[0]
+            rating = movie.get('vote_average', 'N/A')
+            overview = movie.get('overview', 'No summary.')
+            poster_path = movie.get('poster_path')
+            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+            
+            caption = (
+                f"🎬 **{title} ({year})**\n\n"
+                f"⭐ **IMDb Rating:** {rating}/10\n"
+                f"📖 **Plot:** {overview}\n\n"
+                f"👇 **Download Below**"
+            )
+            
+            if poster_url:
+                await bot.send_file(event.chat_id, poster_url, caption=f"`{caption}`\n\n*(Copy the text above)*")
+                await status.delete()
+            else:
+                await status.edit(f"`{caption}`")
+    except Exception as e:
+        await status.edit(f"❌ Error: {e}")
+
 @bot.on(events.NewMessage(pattern='/add'))
 async def add_handler(event):
     sender = await event.get_sender()
@@ -278,25 +408,20 @@ async def add_handler(event):
     except Exception as e:
         await event.reply(f"❌ Error Adding: {e}")
 
-# 🆕 COMMAND 2: /postid (Manual Post by ID)
 @bot.on(events.NewMessage(pattern='/postid'))
 async def postid_handler(event):
     sender = await event.get_sender()
     if not AUTH_USERS or sender.id not in AUTH_USERS: return
-    
-    # Expected Format: /postid 1055 This is the caption
     args = event.text.split(' ', 2)
-    
     if len(args) < 3: 
         return await event.reply("❌ **Usage:** Send Photo with caption:\n`/postid 1234 Your Movie Caption`")
     
     try:
         vault_id = int(args[1])
         caption = args[2]
-    except:
+    except ValueError:
         return await event.reply("❌ **Error:** ID must be a number.\nEx: `/postid 1055 Caption`")
 
-    # Generate Buttons
     me = await bot.get_me()
     deep_link = f"https://t.me/{me.username}?start={vault_id}"
     
@@ -304,9 +429,7 @@ async def postid_handler(event):
     if WEBSITE_HOME: buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
     buttons.append([Button.url("📂 Get File", url=deep_link)])
 
-    # Get Poster from the message itself or reply
     poster = await event.download_media() if event.photo else None
-    
     if not poster:
         reply = await event.get_reply_message()
         if reply and reply.photo:
@@ -319,7 +442,6 @@ async def postid_handler(event):
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
 
-
 @bot.on(events.NewMessage(pattern='/postpack'))
 async def postpack_handler(event):
     sender = await event.get_sender()
@@ -330,7 +452,7 @@ async def postpack_handler(event):
     
     range_str = args[1]
     try: start_id, end_id = range_str.split('-')
-    except: return await event.reply("❌ Invalid Format. Use `100-107`")
+    except Exception: return await event.reply("❌ Invalid Format. Use `100-107`")
 
     dood_link = None
     for arg in args:
@@ -358,8 +480,7 @@ async def postpack_handler(event):
 
 @bot.on(events.NewMessage(pattern='/post'))
 async def post_handler(event):
-    if "/postpack" in event.text: return 
-    if "/postid" in event.text: return
+    if "/postpack" in event.text or "/postid" in event.text: return 
     
     sender = await event.get_sender()
     if not AUTH_USERS or sender.id not in AUTH_USERS: return 
@@ -373,7 +494,6 @@ async def post_handler(event):
     if not vault_id: return await event.reply("❌ **Invalid:** No Vault ID found.")
 
     dood_link = None
-    
     args = event.text.split()
     for arg in args:
         if "http" in arg and "dood" in arg:
@@ -411,11 +531,13 @@ async def post_handler(event):
     except Exception as e: await event.reply(f"❌ Error: {e}")
 
 # ==========================================
-# 🧠 CORE PROCESSOR (Called by Queue Worker)
+# 🧠 CORE PROCESSOR (WITH CLEANUP FIX)
 # ==========================================
 async def process_task(event, source, name, thumb_path):
     status_msg = await event.reply(f"⏳ **Initializing:** `{name}`...")
     last_time = [0]
+    current_thumb = thumb_path
+    
     try:
         # 1. DOWNLOAD
         if isinstance(source, str): 
@@ -428,7 +550,6 @@ async def process_task(event, source, name, thumb_path):
                         total = int(resp.headers.get('content-length', 0))
                         current = 0
                         async with aiofiles.open(name, mode='wb') as f:
-                            # 👇 CHANGED CHUNK SIZE TO 10MB (Speed Hack for Render)
                             async for chunk in resp.content.iter_chunked(10 * 1024 * 1024): 
                                 await f.write(chunk)
                                 current += len(chunk)
@@ -442,13 +563,15 @@ async def process_task(event, source, name, thumb_path):
             success = await smart_download(bot, source, name, dl_callback)
             if not success: return False
 
-        # 2. THUMBNAIL
-        current_thumb = thumb_path
+        # 2. THUMBNAIL (With anti-hang wait_for)
         if not current_thumb:
             generated_thumb = f"{name}_thumb.jpg"
             cmd = ["ffmpeg", "-i", name, "-ss", "00:00:05", "-vframes", "1", generated_thumb, "-y"]
             process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            await process.wait()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                process.kill()
             if os.path.exists(generated_thumb): current_thumb = generated_thumb
 
         # 3. UPLOAD TO VAULT
@@ -480,7 +603,7 @@ async def process_task(event, source, name, thumb_path):
                                 dood_link = fix_dood_link(raw_link)
         except Exception as e: dood_link = f"Error: {e}"
 
-        # 5. FINISH (Clean)
+        # 5. FINISH 
         final_msg = (
             f"✅ **Mirror Complete!**\n\n"
             f"📂 **Vault ID:** {vault_msg.id}\n"
@@ -488,14 +611,20 @@ async def process_task(event, source, name, thumb_path):
             f"👇 Reply with Photo + `/post` to publish."
         )
         await status_msg.edit(final_msg)
-        
-        # Cleanup
-        if os.path.exists(name): os.remove(name)
         return True
         
     except Exception as e:
         await status_msg.edit(f"❌ Error: {str(e)}")
         return False
+        
+    finally:
+        # 🧹 ALWAYS Clean Up to prevent Render storage leaks
+        if os.path.exists(name): 
+            try: os.remove(name)
+            except Exception: pass
+        if current_thumb and current_thumb != thumb_path and os.path.exists(current_thumb):
+            try: os.remove(current_thumb)
+            except Exception: pass
 
 @bot.on(events.NewMessage(pattern='/mirror'))
 async def handler(event):
@@ -534,10 +663,7 @@ async def start_web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # 👇 CHANGE THIS LINE FOR RENDER
-    # Render assigns a random port, usually stored in 'PORT' env var.
     port = int(os.environ.get("PORT", 10000)) 
-    
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"✅ Web Server Started on Port {port}")
 
@@ -546,5 +672,4 @@ if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
     bot.loop.create_task(start_web_server())
     bot.loop.create_task(worker())
-    bot.loop.create_task(refresh_cache())
     bot.run_until_disconnected()
