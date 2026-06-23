@@ -79,11 +79,12 @@ if USE_POSTGRES:
     def get_pg_conn():
         return psycopg2.connect(DATABASE_URL)
     
-    # Initialize Postgres Table
+    # Initialize Postgres Tables
     try:
         with get_pg_conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
+                cursor.execute("CREATE TABLE IF NOT EXISTS vault (msg_id BIGINT PRIMARY KEY, file_name TEXT)")
                 conn.commit()
     except Exception as e:
         print(f"❌ PostgreSQL Init Failed: {e}. Falling back to SQLite.")
@@ -94,6 +95,7 @@ if not USE_POSTGRES:
     sqlite_conn = sqlite3.connect('bot_users.db', check_same_thread=False)
     sqlite_cursor = sqlite_conn.cursor()
     sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+    sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS vault (msg_id INTEGER PRIMARY KEY, file_name TEXT)")
     sqlite_conn.commit()
 
 async def sync_database_from_tg():
@@ -162,6 +164,45 @@ def get_all_users():
             return [row[0] for row in sqlite_cursor.fetchall()]
         except Exception as e:
             print(f"SQLite Error fetching users: {e}")
+            return []
+
+def add_vault_item(msg_id, file_name):
+    """Indexes file name and its ID into the database for unrestricted lightning search"""
+    clean_name = re.sub(r'[._-]', ' ', str(file_name)).strip()
+    if USE_POSTGRES:
+        try:
+            with get_pg_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("INSERT INTO vault (msg_id, file_name) VALUES (%s, %s) ON CONFLICT (msg_id) DO NOTHING", (msg_id, clean_name))
+                    conn.commit()
+        except Exception as e:
+            print(f"PostgreSQL Vault Indexing Error: {e}")
+    else:
+        try:
+            sqlite_cursor.execute("INSERT OR IGNORE INTO vault (msg_id, file_name) VALUES (?, ?)", (msg_id, clean_name))
+            sqlite_conn.commit()
+            bot.loop.create_task(backup_database_to_tg())
+        except Exception as e:
+            print(f"SQLite Vault Indexing Error: {e}")
+
+def search_vault(query):
+    """Queries the database search index instead of triggering restricted Telegram search APIs"""
+    clean_query = f"%{query.strip()}%"
+    if USE_POSTGRES:
+        try:
+            with get_pg_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT msg_id FROM vault WHERE file_name ILIKE %s LIMIT 3", (clean_query,))
+                    return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL Search Error: {e}")
+            return []
+    else:
+        try:
+            sqlite_cursor.execute("SELECT msg_id FROM vault WHERE file_name LIKE ? LIMIT 3", (clean_query,))
+            return [row[0] for row in sqlite_cursor.fetchall()]
+        except Exception as e:
+            print(f"SQLite Search Error: {e}")
             return []
 
 # ==========================================
@@ -377,19 +418,28 @@ async def request_handler(event):
     if not query: 
         return await event.reply("❌ Usage: `/request Movie Name`")
     
-    status = await event.reply(f"🔍 Searching Vault for `{query}`...")
-    found = False
+    status = await event.reply(f"🔍 Searching Vault Index for `{query}`...")
     
     try:
-        async for msg in bot.iter_messages(DB_CHANNEL_ID, search=query, limit=3):
-            if msg.media:
-                await bot.send_file(event.chat_id, msg.media, caption=msg.text)
-                found = True
+        # Querying DB Search Engine to bypass Telegram restrictions
+        msg_ids = search_vault(query)
         
-        if found:
-            return await status.edit("✅ **Here is what I found!**")
+        if msg_ids:
+            messages = await bot.get_messages(DB_CHANNEL_ID, ids=msg_ids)
+            if not isinstance(messages, list):
+                messages = [messages]
+                
+            found = False
+            for msg in messages:
+                if msg and msg.media:
+                    await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    found = True
+            
+            if found:
+                return await status.edit("✅ **Here is what I found!**")
 
-        await status.edit("⚠️ Not found in database. Forwarding request to admins...")
+        # 2. Forward to Admins if not indexed or found
+        await status.edit("⚠️ Not found in database index. Forwarding request to admins...")
         if AUTH_USERS:
             for admin_id in AUTH_USERS:
                 try:
@@ -398,6 +448,54 @@ async def request_handler(event):
             await event.reply("✅ **Request Sent to Admins!**")
     except Exception as e:
         await status.edit(f"❌ Error searching: {str(e)}")
+
+@bot.on(events.NewMessage(pattern='/indexvault'))
+async def index_vault_handler(event):
+    """Admin command to scan the DB_CHANNEL and index all old files into the database."""
+    sender = await event.get_sender()
+    if not AUTH_USERS or sender.id not in AUTH_USERS: 
+        return
+    
+    status = await event.reply("🔄 **Starting Vault Indexing...**\nScanning old messages. This might take a few minutes...")
+    
+    count = 0
+    try:
+        # Iterate through all historical messages in your Vault Channel
+        async for msg in bot.iter_messages(DB_CHANNEL_ID):
+            # Check if the message contains a file
+            if msg.document:
+                file_name = ""
+                
+                # 1. Try to get the actual file name from attributes
+                for attr in msg.document.attributes:
+                    if isinstance(attr, types.DocumentAttributeFilename):
+                        file_name = attr.file_name
+                        break
+                
+                # 2. If no file name, fall back to the caption text
+                if not file_name and msg.text:
+                    file_name = msg.text.split('\n')[0][:60] # Use first line of caption
+                    
+                # 3. Last resort fallback
+                if not file_name:
+                    file_name = f"Movie_File_{msg.id}"
+                
+                # Add to our Database!
+                add_vault_item(msg.id, file_name)
+                count += 1
+                
+                # Edit message every 100 items to avoid Telegram FloodWaits
+                if count % 100 == 0:
+                    await status.edit(f"🔄 **Indexing...**\nAdded **{count}** files to database so far.")
+                    
+        await status.edit(f"✅ **Indexing Complete!**\n\nSuccessfully scanned and added **{count}** old files to the search database. `/request` will now work for everything!")
+        
+        # Force a backup to the channel immediately after massive indexing
+        if not USE_POSTGRES:
+            bot.loop.create_task(backup_database_to_tg())
+            
+    except Exception as e:
+        await status.edit(f"❌ **Error during indexing:** {str(e)}")
 
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
@@ -474,8 +572,18 @@ async def add_handler(event):
     try:
         original_caption = reply.text or ""
         vault_msg = await bot.send_file(DB_CHANNEL_ID, reply.media, caption=original_caption)
+        
+        # Index document attributes or caption text into database
+        index_title = original_caption
+        if reply.file and hasattr(reply.file, 'name') and reply.file.name:
+            index_title = f"{reply.file.name} {original_caption}"
+        if not index_title.strip():
+            index_title = f"Movie_File_{vault_msg.id}"
+            
+        add_vault_item(vault_msg.id, index_title)
+        
         msg = (
-            f"✅ **File Added to DB!**\n\n"
+            f"✅ **File Added & Indexed to DB!**\n\n"
             f"📂 **Vault ID:** {vault_msg.id}\n"
             f"🔗 **Doodstream:** N/A\n\n"
             f"👇 Reply with Photo + `/post` to publish."
@@ -514,6 +622,10 @@ async def postid_handler(event):
     try:
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
+        
+        # Add index fallback on explicit posts
+        add_vault_item(vault_id, caption)
+        
         await event.reply(f"✅ **Published Manually!**\n🆔 Vault ID: {vault_id}")
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
@@ -551,6 +663,11 @@ async def postpack_handler(event):
     try:
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
+        
+        # Index each item inside the series pack block matching names
+        for item_id in range(int(start_id), int(end_id) + 1):
+            add_vault_item(item_id, f"{caption} Episode {item_id}")
+            
         await event.reply(f"✅ Pack Published!\n🔗 **Link:** {pack_link}")
     except Exception as e: await event.reply(f"❌ Error: {e}")
 
@@ -603,6 +720,10 @@ async def post_handler(event):
     try:
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
+        
+        # Real-time search indexing verification update
+        add_vault_item(int(vault_id), caption)
+        
         await event.reply(f"✅ Published!\nButtons added: {len(buttons[0]) if buttons else 0}")
     except Exception as e: await event.reply(f"❌ Error: {e}")
 
@@ -656,6 +777,10 @@ async def process_task(event, source, name, thumb_path):
         async def up_callback(c, t): await progress_bar(c, t, status_msg, "☁️ **Uploading to Vault...**", last_time)
         try:
             vault_msg = await bot.send_file(DB_CHANNEL_ID, file=name, caption=f"🔒 {name}", thumb=current_thumb, supports_streaming=True, progress_callback=up_callback)
+            
+            # Automatically add mirrored files to our search index engine!
+            add_vault_item(vault_msg.id, name)
+            
         except Exception as e: return False
 
         # 4. UPLOAD TO DOODSTREAM
@@ -742,13 +867,11 @@ async def start_web_server():
 
 
 if __name__ == '__main__':
-    # Initialize connection
     bot.start(bot_token=BOT_TOKEN)
     
-    # Run the Telegram database recovery step right at execution startup
+    # Run the database verification step right at startup sequence
     bot.loop.run_until_complete(sync_database_from_tg())
     
-    # Register background coroutine listeners
     bot.loop.create_task(start_web_server())
     bot.loop.create_task(worker())
     bot.run_until_disconnected()
