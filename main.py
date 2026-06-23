@@ -9,6 +9,13 @@ from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.network import ConnectionTcpIntermediate
 
+# Try importing psycopg2 for PostgreSQL support; fallback to SQLite gracefully if not installed
+try:
+    import psycopg2
+    HAS_POSTGRES_LIB = True
+except ImportError:
+    HAS_POSTGRES_LIB = False
+
 # ==========================================
 # ⚙️ CONFIGURATION
 # ==========================================
@@ -19,7 +26,8 @@ DOOD_KEY = os.environ.get("DOOD_KEY", "").strip()
 WEBSITE_HOME = os.environ.get("WEBSITE_HOME", "").strip()
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip()
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip('/')
-TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip() # 🆕 TMDB API Key
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 # 🔐 SECURITY & FORCE SUB
 auth_str = os.environ.get("AUTH_USERS", "").strip()
@@ -62,23 +70,99 @@ bot = TelegramClient(
 print("✅ Bot is Starting...")
 
 # ==========================================
-# 💾 DATABASE (USERS & ANALYTICS)
+# 💾 SMART HYBRID DATABASE MANAGEMENT
 # ==========================================
-conn = sqlite3.connect('bot_users.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-conn.commit()
+USE_POSTGRES = bool(DATABASE_URL and HAS_POSTGRES_LIB)
+
+if USE_POSTGRES:
+    print("🐘 Database Mode: Cloud PostgreSQL Connected!")
+    def get_pg_conn():
+        return psycopg2.connect(DATABASE_URL)
+    
+    # Initialize Postgres Table
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
+                conn.commit()
+    except Exception as e:
+        print(f"❌ PostgreSQL Init Failed: {e}. Falling back to SQLite.")
+        USE_POSTGRES = False
+
+if not USE_POSTGRES:
+    print("💾 Database Mode: SQLite + Telegram Vault Sync (Render Free Tier Engine)")
+    sqlite_conn = sqlite3.connect('bot_users.db', check_same_thread=False)
+    sqlite_cursor = sqlite_conn.cursor()
+    sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+    sqlite_conn.commit()
+
+async def sync_database_from_tg():
+    """Restores the database file from Telegram on startup (SQLite Only)"""
+    if USE_POSTGRES: return
+    try:
+        print("🔄 Syncing user database from Telegram Vault...")
+        async for msg in bot.iter_messages(DB_CHANNEL_ID, search="#USER_BACKUP", limit=1):
+            if msg.document:
+                await bot.download_media(msg.document, file='bot_users.db')
+                print("✅ Database synced successfully from Telegram!")
+                return
+        print("ℹ️ No previous database backup found. Starting fresh.")
+    except Exception as e:
+        print(f"❌ Backup sync failed: {e}")
+
+async def backup_database_to_tg():
+    """Backs up the SQLite database file to your private channel (SQLite Only)"""
+    if USE_POSTGRES: return
+    try:
+        if os.path.exists('bot_users.db'):
+            # Clear older backups to prevent spamming the channel
+            async for msg in bot.iter_messages(DB_CHANNEL_ID, search="#USER_BACKUP"):
+                await msg.delete()
+            
+            await bot.send_file(
+                DB_CHANNEL_ID, 
+                'bot_users.db', 
+                caption="💾 #USER_BACKUP\nDO NOT DELETE. Keeps your user broadcast list alive on Render's free tier."
+            )
+            print("✅ Database backup pushed to Telegram Vault!")
+    except Exception as e:
+        print(f"❌ Backup upload failed: {e}")
 
 def add_user(user_id):
-    try:
-        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-    except Exception as e:
-        print(f"DB Error: {e}")
+    if USE_POSTGRES:
+        try:
+            with get_pg_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+                    conn.commit()
+        except Exception as e:
+            print(f"PostgreSQL Error adding user: {e}")
+    else:
+        try:
+            sqlite_cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+            sqlite_conn.commit()
+            if sqlite_cursor.rowcount > 0:
+                bot.loop.create_task(backup_database_to_tg())
+        except Exception as e:
+            print(f"SQLite Error adding user: {e}")
 
 def get_all_users():
-    cursor.execute("SELECT user_id FROM users")
-    return [row[0] for row in cursor.fetchall()]
+    if USE_POSTGRES:
+        try:
+            with get_pg_conn() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT user_id FROM users")
+                    return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"PostgreSQL Error fetching users: {e}")
+            return []
+    else:
+        try:
+            sqlite_cursor.execute("SELECT user_id FROM users")
+            return [row[0] for row in sqlite_cursor.fetchall()]
+        except Exception as e:
+            print(f"SQLite Error fetching users: {e}")
+            return []
 
 # ==========================================
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
@@ -176,7 +260,6 @@ async def stream_handler(request):
         file_size = message.document.size
         mime_type = message.document.mime_type or "application/octet-stream"
 
-        # Handle HTTP Range Requests (Allows seeking in video player)
         range_header = request.headers.get('Range')
         start = 0
         end = file_size - 1
@@ -197,8 +280,7 @@ async def stream_handler(request):
         
         await response.prepare(request)
 
-        # Download chunks and yield to browser
-        offset_limit = 1048576 # 1MB chunks
+        offset_limit = 1048576 
         chunk_start = start - (start % offset_limit)
         
         async for chunk in bot.iter_download(message.media, offset=chunk_start):
@@ -228,7 +310,8 @@ async def root_handler(request):
 @bot.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     sender = await event.get_sender()
-    add_user(sender.id) # 🆕 Save user to DB
+    if sender:
+        add_user(sender.id)
     args = event.text.split()
     is_joined = await check_subscription(sender.id)
     
@@ -248,7 +331,6 @@ async def start_handler(event):
                 messages = await bot.get_messages(DB_CHANNEL_ID, ids=ids_to_fetch)
                 for msg in messages:
                     if msg and msg.media:
-                        # 🆕 Secure Copy (No Forward Tag)
                         await bot.send_file(event.chat_id, msg.media, caption=msg.text)
                 await status.delete()
             except Exception: await status.edit("❌ Pack not found.")
@@ -257,7 +339,6 @@ async def start_handler(event):
                 msg_id = int(param)
                 msg = await bot.get_messages(DB_CHANNEL_ID, ids=msg_id)
                 if msg and msg.media:
-                    # 🆕 Secure Copy (No Forward Tag)
                     await bot.send_file(event.chat_id, msg.media, caption=msg.text)
                     await status.delete()
                 else:
@@ -288,7 +369,6 @@ async def start_handler(event):
 async def callback_handler(event):
     await event.answer("💡 TYPE:\n/request Name", alert=True)
 
-# 🆕 AUTO DB SEARCH REQUEST
 @bot.on(events.NewMessage(pattern='/request'))
 async def request_handler(event):
     query = event.text.replace("/request", "").strip()
@@ -301,7 +381,6 @@ async def request_handler(event):
     found = False
     
     try:
-        # 1. Search the DB Channel 
         async for msg in bot.iter_messages(DB_CHANNEL_ID, search=query, limit=3):
             if msg.media:
                 await bot.send_file(event.chat_id, msg.media, caption=msg.text)
@@ -310,7 +389,6 @@ async def request_handler(event):
         if found:
             return await status.edit("✅ **Here is what I found!**")
 
-        # 2. If not found, send request to Admins
         await status.edit("⚠️ Not found in database. Forwarding request to admins...")
         if AUTH_USERS:
             for admin_id in AUTH_USERS:
@@ -321,7 +399,6 @@ async def request_handler(event):
     except Exception as e:
         await status.edit(f"❌ Error searching: {str(e)}")
 
-# 🆕 ADMIN: BROADCAST & STATS
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
     if event.sender_id not in AUTH_USERS: return
@@ -342,12 +419,11 @@ async def broadcast_handler(event):
         try:
             await bot.send_message(user, msg)
             sent += 1
-            await asyncio.sleep(0.1) # Prevent flood wait
+            await asyncio.sleep(0.1) 
         except Exception: pass
         
     await status.edit(f"✅ **Broadcast Complete!**\nDelivered to: {sent}/{len(users)}")
 
-# 🆕 ADMIN: FETCH TMDB METADATA
 @bot.on(events.NewMessage(pattern='/tmdb'))
 async def tmdb_handler(event):
     if event.sender_id not in AUTH_USERS: return
@@ -563,7 +639,7 @@ async def process_task(event, source, name, thumb_path):
             success = await smart_download(bot, source, name, dl_callback)
             if not success: return False
 
-        # 2. THUMBNAIL (With anti-hang wait_for)
+        # 2. THUMBNAIL 
         if not current_thumb:
             generated_thumb = f"{name}_thumb.jpg"
             cmd = ["ffmpeg", "-i", name, "-ss", "00:00:05", "-vframes", "1", generated_thumb, "-y"]
@@ -618,7 +694,6 @@ async def process_task(event, source, name, thumb_path):
         return False
         
     finally:
-        # 🧹 ALWAYS Clean Up to prevent Render storage leaks
         if os.path.exists(name): 
             try: os.remove(name)
             except Exception: pass
@@ -651,8 +726,6 @@ async def handler(event):
     
     for source, name in tasks:
         await WORK_QUEUE.put((event, source, name, batch_thumb))
-    
-    if batch_thumb: pass
 
 async def start_web_server():
     app = web.Application()
@@ -669,7 +742,13 @@ async def start_web_server():
 
 
 if __name__ == '__main__':
+    # Initialize connection
     bot.start(bot_token=BOT_TOKEN)
+    
+    # Run the Telegram database recovery step right at execution startup
+    bot.loop.run_until_complete(sync_database_from_tg())
+    
+    # Register background coroutine listeners
     bot.loop.create_task(start_web_server())
     bot.loop.create_task(worker())
     bot.run_until_disconnected()
