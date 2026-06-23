@@ -2,3 +2,4 @@ telethon
 aiohttp
 aiofiles
 pysocks
+psycopg2-binary
