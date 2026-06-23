@@ -464,7 +464,11 @@ async def start_handler(event):
                 messages = await bot.get_messages(DB_CHANNEL_ID, ids=ids_to_fetch)
                 for msg in messages:
                     if msg and msg.media:
-                        await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                        sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                        warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
+
+                        # Start the timer in the background without freezing the bot!
+                        bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
                 await status.delete()
             except Exception: await status.edit("❌ Pack not found.")
         else:
@@ -472,7 +476,11 @@ async def start_handler(event):
                 msg_id = int(param)
                 msg = await bot.get_messages(DB_CHANNEL_ID, ids=msg_id)
                 if msg and msg.media:
-                    await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
+                    
+                    # Start the timer in the background without freezing the bot!
+                    bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
                     await status.delete()
                 else:
                     await status.edit("❌ File not found.")
@@ -524,7 +532,11 @@ async def request_handler(event):
             found = False
             for msg in messages:
                 if msg and msg.media:
-                    await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
+                    warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
+                    
+                    # Start the timer in the background without freezing the bot!
+                    bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
                     found = True
             
             if found:
