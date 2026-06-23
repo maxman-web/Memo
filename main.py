@@ -119,22 +119,20 @@ if USE_POSTGRES:
     try:
         with get_pg_conn() as conn:
             with conn.cursor() as cursor:
+                # 1. Ensure core tables exist
                 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS vault (
-                        msg_id BIGINT PRIMARY KEY, 
-                        file_name TEXT,
-                        title TEXT,
-                        media_type TEXT,
-                        season INTEGER,
-                        episode INTEGER
-                    )
-                """)
+                cursor.execute("CREATE TABLE IF NOT EXISTS vault (msg_id BIGINT PRIMARY KEY, file_name TEXT)")
+                
+                # 2. Automatically upgrade old tables if columns are missing
+                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS title TEXT")
+                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS media_type TEXT")
+                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS season INTEGER")
+                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS episode INTEGER")
                 conn.commit()
     except Exception as e:
         print(f"❌ PostgreSQL Table Alteration/Init Failed: {e}. Falling back to SQLite.")
         USE_POSTGRES = False
-
+        
 if not USE_POSTGRES:
     print("💾 Database Mode: SQLite + Telegram Vault Sync (Render Free Tier Engine)")
     sqlite_conn = sqlite3.connect('bot_users.db', check_same_thread=False)
