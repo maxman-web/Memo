@@ -70,6 +70,43 @@ bot = TelegramClient(
 print("✅ Bot is Starting...")
 
 # ==========================================
+# 🧠 SMART FILENAME & META PARSER
+# ==========================================
+def parse_media_meta(file_name):
+    """
+    Analyzes messy file names or captions and extracts a clean title, 
+    media type (movie/series), season number, and episode number.
+    """
+    if not file_name:
+        return "Unknown File", "movie", None, None
+        
+    # Standardize spacing and strip typical extension blocks
+    clean_name = re.sub(r'[._-]', ' ', str(file_name)).strip()
+    clean_name = re.sub(r'\s+', ' ', clean_name)
+    
+    # 1. Pattern Matching: S01E02, S1E2, S01 E02
+    pattern_se = re.search(r'(.*?)\bS(\d{1,2})\s*E(\d{1,3})\b', clean_name, re.IGNORECASE)
+    if pattern_se:
+        title = pattern_se.group(1).strip()
+        return title, "series", int(pattern_se.group(2)), int(pattern_se.group(3))
+        
+    # 2. Pattern Matching: 1x02 or 01x02
+    pattern_x = re.search(r'(.*?)\b(\d{1,2})x(\d{1,3})\b', clean_name, re.IGNORECASE)
+    if pattern_x:
+        title = pattern_x.group(1).strip()
+        return title, "series", int(pattern_x.group(2)), int(pattern_x.group(3))
+
+    # 3. Pattern Matching: Standalone "Episode 05" or "EP 05" (Defaults to Season 1)
+    pattern_ep = re.search(r'(.*?)\b(?:Ep|Episode)\s*(\d{1,3})\b', clean_name, re.IGNORECASE)
+    if pattern_ep:
+        title = pattern_ep.group(1).strip()
+        return title, "series", 1, int(pattern_ep.group(2))
+
+    # 4. Fallback: Treat as Movie and clear common encoding tags to extract the cleanest title
+    movie_title = re.sub(r'\b(1080p|720p|4k|hdr|web\s*dl|bluray|x264|h264|x265|hevc|hindi|english|dual\s*audio)\b.*', '', clean_name, flags=re.IGNORECASE).strip()
+    return movie_title or clean_name, "movie", None, None
+
+# ==========================================
 # 💾 SMART HYBRID DATABASE MANAGEMENT
 # ==========================================
 USE_POSTGRES = bool(DATABASE_URL and HAS_POSTGRES_LIB)
@@ -79,15 +116,23 @@ if USE_POSTGRES:
     def get_pg_conn():
         return psycopg2.connect(DATABASE_URL)
     
-    # Initialize Postgres Tables
     try:
         with get_pg_conn() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
-                cursor.execute("CREATE TABLE IF NOT EXISTS vault (msg_id BIGINT PRIMARY KEY, file_name TEXT)")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS vault (
+                        msg_id BIGINT PRIMARY KEY, 
+                        file_name TEXT,
+                        title TEXT,
+                        media_type TEXT,
+                        season INTEGER,
+                        episode INTEGER
+                    )
+                """)
                 conn.commit()
     except Exception as e:
-        print(f"❌ PostgreSQL Init Failed: {e}. Falling back to SQLite.")
+        print(f"❌ PostgreSQL Table Alteration/Init Failed: {e}. Falling back to SQLite.")
         USE_POSTGRES = False
 
 if not USE_POSTGRES:
@@ -95,7 +140,16 @@ if not USE_POSTGRES:
     sqlite_conn = sqlite3.connect('bot_users.db', check_same_thread=False)
     sqlite_cursor = sqlite_conn.cursor()
     sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-    sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS vault (msg_id INTEGER PRIMARY KEY, file_name TEXT)")
+    sqlite_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vault (
+            msg_id INTEGER PRIMARY KEY, 
+            file_name TEXT,
+            title TEXT,
+            media_type TEXT,
+            season INTEGER,
+            episode INTEGER
+        )
+    """)
     sqlite_conn.commit()
 
 async def sync_database_from_tg():
@@ -117,7 +171,6 @@ async def backup_database_to_tg():
     if USE_POSTGRES: return
     try:
         if os.path.exists('bot_users.db'):
-            # Clear older backups to prevent spamming the channel
             async for msg in bot.iter_messages(DB_CHANNEL_ID, search="#USER_BACKUP"):
                 await msg.delete()
             
@@ -167,39 +220,55 @@ def get_all_users():
             return []
 
 def add_vault_item(msg_id, file_name):
-    """Indexes file name and its ID into the database for unrestricted lightning search"""
-    clean_name = re.sub(r'[._-]', ' ', str(file_name)).strip()
+    """Indexes structural file property details into the database"""
+    title, media_type, season, episode = parse_media_meta(file_name)
     if USE_POSTGRES:
         try:
             with get_pg_conn() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute("INSERT INTO vault (msg_id, file_name) VALUES (%s, %s) ON CONFLICT (msg_id) DO NOTHING", (msg_id, clean_name))
+                    cursor.execute("""
+                        INSERT INTO vault (msg_id, file_name, title, media_type, season, episode) 
+                        VALUES (%s, %s, %s, %s, %s, %s) 
+                        ON CONFLICT (msg_id) DO UPDATE 
+                        SET file_name = EXCLUDED.file_name, title = EXCLUDED.title, media_type = EXCLUDED.media_type, season = EXCLUDED.season, episode = EXCLUDED.episode
+                    """, (msg_id, file_name, title, media_type, season, episode))
                     conn.commit()
         except Exception as e:
             print(f"PostgreSQL Vault Indexing Error: {e}")
     else:
         try:
-            sqlite_cursor.execute("INSERT OR IGNORE INTO vault (msg_id, file_name) VALUES (?, ?)", (msg_id, clean_name))
+            sqlite_cursor.execute("""
+                INSERT OR REPLACE INTO vault (msg_id, file_name, title, media_type, season, episode) 
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (msg_id, file_name, title, media_type, season, episode))
             sqlite_conn.commit()
             bot.loop.create_task(backup_database_to_tg())
         except Exception as e:
             print(f"SQLite Vault Indexing Error: {e}")
 
 def search_vault(query):
-    """Queries the database search index instead of triggering restricted Telegram search APIs"""
+    """Queries the database search index sorted chronologically by season and episode"""
     clean_query = f"%{query.strip()}%"
     if USE_POSTGRES:
         try:
             with get_pg_conn() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute("SELECT msg_id FROM vault WHERE file_name ILIKE %s LIMIT 3", (clean_query,))
+                    cursor.execute("""
+                        SELECT msg_id FROM vault 
+                        WHERE title ILIKE %s OR file_name ILIKE %s 
+                        ORDER BY media_type DESC, season ASC, episode ASC NULLS LAST LIMIT 5
+                    """, (clean_query, clean_query))
                     return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             print(f"PostgreSQL Search Error: {e}")
             return []
     else:
         try:
-            sqlite_cursor.execute("SELECT msg_id FROM vault WHERE file_name LIKE ? LIMIT 3", (clean_query,))
+            sqlite_cursor.execute("""
+                SELECT msg_id FROM vault 
+                WHERE title LIKE ? OR file_name LIKE ? 
+                ORDER BY media_type DESC, season ASC, episode ASC LIMIT 5
+            """, (clean_query, clean_query))
             return [row[0] for row in sqlite_cursor.fetchall()]
         except Exception as e:
             print(f"SQLite Search Error: {e}")
@@ -396,7 +465,8 @@ async def start_handler(event):
             "**4️⃣ POST ID (Manual)**\nPhoto Caption: `/postid 1234 Caption...`\n"
             "**5️⃣ TMDB**\n`/tmdb Inception` to get movie details.\n"
             "**6️⃣ BROADCAST**\n`/broadcast Message` to message all users.\n"
-            "**7️⃣ STATS**\n`/stats` to view DB users."
+            "**7️⃣ STATS**\n`/stats` to view DB users.\n"
+            "**8️⃣ INDEX ALL**\n`/indexvault` to backfill structured items."
         )
         await event.reply(admin_guide)
     else:
@@ -418,10 +488,9 @@ async def request_handler(event):
     if not query: 
         return await event.reply("❌ Usage: `/request Movie Name`")
     
-    status = await event.reply(f"🔍 Searching Vault Index for `{query}`...")
+    status = await event.reply(f"🔍 Searching Structured Index for `{query}`...")
     
     try:
-        # Querying DB Search Engine to bypass Telegram restrictions
         msg_ids = search_vault(query)
         
         if msg_ids:
@@ -436,9 +505,8 @@ async def request_handler(event):
                     found = True
             
             if found:
-                return await status.edit("✅ **Here is what I found!**")
+                return await status.edit("✅ **Here is what I found sorted for you!**")
 
-        # 2. Forward to Admins if not indexed or found
         await status.edit("⚠️ Not found in database index. Forwarding request to admins...")
         if AUTH_USERS:
             for admin_id in AUTH_USERS:
@@ -451,51 +519,35 @@ async def request_handler(event):
 
 @bot.on(events.NewMessage(pattern='/indexvault'))
 async def index_vault_handler(event):
-    """Admin command to scan the DB_CHANNEL and index all old files into the database."""
+    """Admin command to re-scan the entire channel and structure old items into structured records."""
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS: 
-        return
+    if not AUTH_USERS or sender.id not in AUTH_USERS: return
     
-    status = await event.reply("🔄 **Starting Vault Indexing...**\nScanning old messages. This might take a few minutes...")
-    
+    status = await event.reply("🔄 **Starting Structured Vault Sync Indexing...**\nProcessing past entries. Please hold...")
     count = 0
     try:
-        # Iterate through all historical messages in your Vault Channel
         async for msg in bot.iter_messages(DB_CHANNEL_ID):
-            # Check if the message contains a file
             if msg.document:
                 file_name = ""
-                
-                # 1. Try to get the actual file name from attributes
                 for attr in msg.document.attributes:
                     if isinstance(attr, types.DocumentAttributeFilename):
                         file_name = attr.file_name
                         break
-                
-                # 2. If no file name, fall back to the caption text
                 if not file_name and msg.text:
-                    file_name = msg.text.split('\n')[0][:60] # Use first line of caption
-                    
-                # 3. Last resort fallback
+                    file_name = msg.text.split('\n')[0][:80]
                 if not file_name:
-                    file_name = f"Movie_File_{msg.id}"
+                    file_name = f"Media_File_{msg.id}"
                 
-                # Add to our Database!
                 add_vault_item(msg.id, file_name)
                 count += 1
-                
-                # Edit message every 100 items to avoid Telegram FloodWaits
                 if count % 100 == 0:
-                    await status.edit(f"🔄 **Indexing...**\nAdded **{count}** files to database so far.")
+                    await status.edit(f"🔄 **Structuring Progress...**\nSuccessfully classified **{count}** records so far.")
                     
-        await status.edit(f"✅ **Indexing Complete!**\n\nSuccessfully scanned and added **{count}** old files to the search database. `/request` will now work for everything!")
-        
-        # Force a backup to the channel immediately after massive indexing
+        await status.edit(f"✅ **Structured Index Complete!**\nSorted, parsed, and logged **{count}** files into chronological records.")
         if not USE_POSTGRES:
             bot.loop.create_task(backup_database_to_tg())
-            
     except Exception as e:
-        await status.edit(f"❌ **Error during indexing:** {str(e)}")
+        await status.edit(f"❌ Structural Index Fault: {str(e)}")
 
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
@@ -573,7 +625,6 @@ async def add_handler(event):
         original_caption = reply.text or ""
         vault_msg = await bot.send_file(DB_CHANNEL_ID, reply.media, caption=original_caption)
         
-        # Index document attributes or caption text into database
         index_title = original_caption
         if reply.file and hasattr(reply.file, 'name') and reply.file.name:
             index_title = f"{reply.file.name} {original_caption}"
@@ -583,7 +634,7 @@ async def add_handler(event):
         add_vault_item(vault_msg.id, index_title)
         
         msg = (
-            f"✅ **File Added & Indexed to DB!**\n\n"
+            f"✅ **File Added & Structured to DB!**\n\n"
             f"📂 **Vault ID:** {vault_msg.id}\n"
             f"🔗 **Doodstream:** N/A\n\n"
             f"👇 Reply with Photo + `/post` to publish."
@@ -623,9 +674,7 @@ async def postid_handler(event):
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
         
-        # Add index fallback on explicit posts
         add_vault_item(vault_id, caption)
-        
         await event.reply(f"✅ **Published Manually!**\n🆔 Vault ID: {vault_id}")
     except Exception as e:
         await event.reply(f"❌ Error: {e}")
@@ -664,7 +713,6 @@ async def postpack_handler(event):
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
         
-        # Index each item inside the series pack block matching names
         for item_id in range(int(start_id), int(end_id) + 1):
             add_vault_item(item_id, f"{caption} Episode {item_id}")
             
@@ -721,9 +769,7 @@ async def post_handler(event):
         await bot.send_file(PUBLIC_CHANNEL_ID, poster, caption=caption, buttons=buttons)
         if poster: os.remove(poster)
         
-        # Real-time search indexing verification update
         add_vault_item(int(vault_id), caption)
-        
         await event.reply(f"✅ Published!\nButtons added: {len(buttons[0]) if buttons else 0}")
     except Exception as e: await event.reply(f"❌ Error: {e}")
 
@@ -736,7 +782,6 @@ async def process_task(event, source, name, thumb_path):
     current_thumb = thumb_path
     
     try:
-        # 1. DOWNLOAD
         if isinstance(source, str): 
             await status_msg.edit(f"🚀 **Downloading URL...**")
             headers = {'User-Agent': 'Mozilla/5.0'}
@@ -760,7 +805,6 @@ async def process_task(event, source, name, thumb_path):
             success = await smart_download(bot, source, name, dl_callback)
             if not success: return False
 
-        # 2. THUMBNAIL 
         if not current_thumb:
             generated_thumb = f"{name}_thumb.jpg"
             cmd = ["ffmpeg", "-i", name, "-ss", "00:00:05", "-vframes", "1", generated_thumb, "-y"]
@@ -771,19 +815,14 @@ async def process_task(event, source, name, thumb_path):
                 process.kill()
             if os.path.exists(generated_thumb): current_thumb = generated_thumb
 
-        # 3. UPLOAD TO VAULT
         await status_msg.edit("⚡ **Uploading to Vault...**")
         last_time = [0]
         async def up_callback(c, t): await progress_bar(c, t, status_msg, "☁️ **Uploading to Vault...**", last_time)
         try:
             vault_msg = await bot.send_file(DB_CHANNEL_ID, file=name, caption=f"🔒 {name}", thumb=current_thumb, supports_streaming=True, progress_callback=up_callback)
-            
-            # Automatically add mirrored files to our search index engine!
             add_vault_item(vault_msg.id, name)
-            
         except Exception as e: return False
 
-        # 4. UPLOAD TO DOODSTREAM
         await status_msg.edit("⚡ **Uploading to Doodstream...**")
         dood_link = "N/A"
         try:
@@ -804,7 +843,6 @@ async def process_task(event, source, name, thumb_path):
                                 dood_link = fix_dood_link(raw_link)
         except Exception as e: dood_link = f"Error: {e}"
 
-        # 5. FINISH 
         final_msg = (
             f"✅ **Mirror Complete!**\n\n"
             f"📂 **Vault ID:** {vault_msg.id}\n"
@@ -869,7 +907,6 @@ async def start_web_server():
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
     
-    # Run the database verification step right at startup sequence
     bot.loop.run_until_complete(sync_database_from_tg())
     
     bot.loop.create_task(start_web_server())
