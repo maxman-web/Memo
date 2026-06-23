@@ -519,35 +519,57 @@ async def request_handler(event):
 
 @bot.on(events.NewMessage(pattern='/indexvault'))
 async def index_vault_handler(event):
-    """Admin command to re-scan the entire channel and structure old items into structured records."""
+    """Admin command to bypass GetHistoryRequest restrictions by crawling message IDs directly."""
     sender = await event.get_sender()
     if not AUTH_USERS or sender.id not in AUTH_USERS: return
     
-    status = await event.reply("🔄 **Starting Structured Vault Sync Indexing...**\nProcessing past entries. Please hold...")
-    count = 0
+    status = await event.reply("🔄 **Starting Restricted-Bypass Indexing...**\nFetching latest message checkpoint...")
+    
     try:
-        async for msg in bot.iter_messages(DB_CHANNEL_ID):
-            if msg.document:
-                file_name = ""
-                for attr in msg.document.attributes:
-                    if isinstance(attr, types.DocumentAttributeFilename):
-                        file_name = attr.file_name
-                        break
-                if not file_name and msg.text:
-                    file_name = msg.text.split('\n')[0][:80]
-                if not file_name:
-                    file_name = f"Media_File_{msg.id}"
-                
-                add_vault_item(msg.id, file_name)
-                count += 1
-                if count % 100 == 0:
-                    await status.edit(f"🔄 **Structuring Progress...**\nSuccessfully classified **{count}** records so far.")
+        # 1. Find the highest message ID in the channel by sending a temporary message or checking latest
+        latest_msg = await bot.send_message(DB_CHANNEL_ID, "🔄 Checking channel sync point...")
+        max_id = latest_msg.id
+        await latest_msg.delete() # Clean it up immediately
+        
+        await status.edit(f"🔍 **Checkpoint found at ID: {max_id}**\nScanning files backwards to bypass Telegram restrictions...")
+        
+        count = 0
+        # 2. Walk backwards through every possible message ID
+        for current_id in range(max_id, 0, -1):
+            try:
+                msg = await bot.get_messages(DB_CHANNEL_ID, ids=current_id)
+                if msg and msg.document:
+                    file_name = ""
+                    for attr in msg.document.attributes:
+                        if isinstance(attr, types.DocumentAttributeFilename):
+                            file_name = attr.file_name
+                            break
+                    if not file_name and msg.text:
+                        file_name = msg.text.split('\n')[0][:80]
+                    if not file_name:
+                        file_name = f"Media_File_{msg.id}"
                     
-        await status.edit(f"✅ **Structured Index Complete!**\nSorted, parsed, and logged **{count}** files into chronological records.")
+                    add_vault_item(msg.id, file_name)
+                    count += 1
+                    
+                    if count % 20 == 0:  # Frequent small updates so you know it's working
+                        await status.edit(f"🔄 **Bypass Indexing Progress...**\nParsed **{count}** files.\nChecking ID: {current_id}...")
+                
+                # Tiny rest to stay completely clear of FloodWaits
+                if current_id % 30 == 0:
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                # If a single message ID fails or is deleted, keep moving!
+                continue
+                
+        await status.edit(f"✅ **Restricted-Bypass Indexing Complete!**\nSuccessfully indexed **{count}** files without using history APIs.")
         if not USE_POSTGRES:
             bot.loop.create_task(backup_database_to_tg())
+            
     except Exception as e:
-        await status.edit(f"❌ Structural Index Fault: {str(e)}")
+        await status.edit(f"❌ Indexing Bypass Failed: {str(e)}")
+
 
 @bot.on(events.NewMessage(pattern='/stats'))
 async def stats_handler(event):
