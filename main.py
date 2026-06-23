@@ -961,6 +961,39 @@ async def start_web_server():
     print(f"✅ Web Server Started on Port {port}")
 
 
+@bot.on(events.NewMessage(pattern='/checkchannel'))
+async def check_channel_handler(event):
+    if event.sender_id not in AUTH_USERS: return
+    try:
+        # Fetch the entity using the ID from your config
+        channel = await bot.get_entity(DB_CHANNEL_ID)
+        
+        # channel.title gives you the human-readable name
+        # channel.id gives you the technical ID
+        await event.reply(
+            f"✅ **Storage Channel Verified!**\n\n"
+            f"🏷️ **Name:** {channel.title}\n"
+            f"🆔 **ID:** `{DB_CHANNEL_ID}`"
+        )
+    except Exception as e:
+        await event.reply(f"❌ Could not find channel! Check your DB_CHANNEL_ID.\nError: {e}")
+
+@bot.on(events.NewMessage(pattern='/checkdb'))
+async def check_db_handler(event):
+    if USE_POSTGRES:
+        conn = get_pg_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM vault")
+        count = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        await event.reply(f"🐘 Postgres Database contains {count} items in 'vault'.")
+    else:
+        # SQLite
+        sqlite_cursor.execute("SELECT COUNT(*) FROM vault")
+        count = sqlite_cursor.fetchone()[0]
+        await event.reply(f"💾 SQLite Database contains {count} items in 'vault'.")
+
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
     
