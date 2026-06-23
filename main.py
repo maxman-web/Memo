@@ -245,33 +245,47 @@ def add_vault_item(msg_id, file_name):
             print(f"SQLite Vault Indexing Error: {e}")
 
 def search_vault(query):
-    """Queries the database search index sorted chronologically by season and episode"""
-    clean_query = f"%{query.strip()}%"
+    """Upgraded Search: Handles multi-word queries for better accuracy"""
+    words = query.strip().split()
+    if not words: return []
+    
     if USE_POSTGRES:
         try:
             with get_pg_conn() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute("""
+                    # Dynamically search for EVERY word in the query
+                    conditions = " AND ".join(["(title ILIKE %s OR file_name ILIKE %s)" for _ in words])
+                    params = []
+                    for word in words:
+                        params.extend([f"%{word}%", f"%{word}%"])
+                    
+                    sql = f"""
                         SELECT msg_id FROM vault 
-                        WHERE title ILIKE %s OR file_name ILIKE %s 
-                        ORDER BY media_type DESC, season ASC, episode ASC NULLS LAST LIMIT 5
-                    """, (clean_query, clean_query))
+                        WHERE {conditions}
+                        ORDER BY media_type DESC, season ASC, episode ASC NULLS LAST LIMIT 8
+                    """
+                    cursor.execute(sql, tuple(params))
                     return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             print(f"PostgreSQL Search Error: {e}")
             return []
     else:
         try:
-            sqlite_cursor.execute("""
+            conditions = " AND ".join(["(title LIKE ? OR file_name LIKE ?)" for _ in words])
+            params = []
+            for word in words:
+                params.extend([f"%{word}%", f"%{word}%"])
+                
+            sql = f"""
                 SELECT msg_id FROM vault 
-                WHERE title LIKE ? OR file_name LIKE ? 
-                ORDER BY media_type DESC, season ASC, episode ASC LIMIT 5
-            """, (clean_query, clean_query))
+                WHERE {conditions}
+                ORDER BY media_type DESC, season ASC, episode ASC LIMIT 8
+            """
+            sqlite_cursor.execute(sql, tuple(params))
             return [row[0] for row in sqlite_cursor.fetchall()]
         except Exception as e:
             print(f"SQLite Search Error: {e}")
             return []
-
 # ==========================================
 # 🛠️ HELPER: FORCE CORRECT DOMAIN
 # ==========================================
@@ -286,6 +300,17 @@ def fix_dood_link(link):
     if "myvidplay.com" not in clean_link and "http" in clean_link:
         clean_link = re.sub(r'https?://[^/]+', 'https://myvidplay.com', clean_link)
     return clean_link
+
+
+async def auto_delete_task(event, messages, delay=300):
+    """Waits for 'delay' seconds, then deletes the messages."""
+    await asyncio.sleep(delay)
+    try:
+        for msg in messages:
+            await msg.delete()
+        await event.respond("⏱️ *Files auto-deleted for security. Request them again if needed!*")
+    except Exception:
+        pass
 
 # ==========================================
 # 🛠️ HELPER: CHECK SUBSCRIPTION
