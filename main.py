@@ -5600,7 +5600,8 @@ async def start_web_server():
             ),
             web.get(
                 "/stream/{msg_id}",
-                stream_handler
+                stream_handler,
+                allow_head=False
             ),
             web.head(
                 "/stream/{msg_id}",
