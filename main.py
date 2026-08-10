@@ -835,6 +835,215 @@ def release_pg_conn(conn):
 
 
 # ============================================================
+# BOT-SAFE MESSAGE LOOKUP
+#
+# Telegram flatly refuses GetHistoryRequest (history browsing,
+# offset_date iteration, search) for BOT accounts, no matter
+# what rights the bot has in the channel. It raises:
+#
+#   "The API access for bot users is restricted..."
+#
+# What bots CAN do is fetch specific message IDs directly
+# (channels.GetMessages). Everything below is built only on
+# top of that, so it works from a bot session.
+# ============================================================
+async def get_message_by_id(chat, msg_id):
+
+    try:
+        return await bot.get_messages(
+            chat,
+            ids=msg_id
+        )
+
+    except Exception:
+        return None
+
+
+async def get_messages_by_ids(chat, msg_ids):
+    """
+    Batched version of get_message_by_id. Telegram accepts a
+    list of IDs in one call, which is far cheaper than one
+    call per ID when scanning a whole channel.
+    """
+
+    if not msg_ids:
+        return []
+
+    try:
+
+        messages = await bot.get_messages(
+            chat,
+            ids=list(msg_ids)
+        )
+
+        if not isinstance(messages, list):
+            messages = [messages]
+
+        return messages
+
+    except Exception as e:
+
+        print(
+            f"Batch fetch failed for "
+            f"{msg_ids[0]}-{msg_ids[-1]}: {e}"
+        )
+
+        return [None] * len(msg_ids)
+
+
+async def find_message_near_id(chat, msg_id, max_probe=5):
+    """
+    get_messages(ids=X) returns None for a deleted/nonexistent
+    ID. Probe a few IDs outward to find a real message near the
+    one requested, so gaps don't break boundary searches.
+    """
+
+    msg = await get_message_by_id(chat, msg_id)
+
+    if msg:
+        return msg
+
+    for offset in range(1, max_probe + 1):
+
+        for candidate in (msg_id + offset, msg_id - offset):
+
+            if candidate < 1:
+                continue
+
+            msg = await get_message_by_id(chat, candidate)
+
+            if msg:
+                return msg
+
+    return None
+
+
+async def find_latest_message_id(chat, cap=2_000_000):
+    """
+    Bots can't ask Telegram "what's the newest message" via any
+    history API. Instead, probe IDs directly (allowed for bots),
+    expanding exponentially until messages stop existing, then
+    binary-search the exact boundary.
+    """
+
+    lo, hi, last_found = 1, 1, None
+
+    while hi < cap:
+
+        if await find_message_near_id(chat, hi, max_probe=0):
+
+            last_found = hi
+            lo = hi
+            hi *= 2
+
+            await asyncio.sleep(0.05)
+
+        else:
+            break
+
+    if last_found is None:
+        return None
+
+    low, high = lo, hi
+
+    while low < high - 1:
+
+        mid = (low + high) // 2
+
+        if await find_message_near_id(chat, mid, max_probe=0):
+            low = mid
+        else:
+            high = mid
+
+        await asyncio.sleep(0.05)
+
+    return low
+
+
+async def find_id_for_date(chat, target_date, hi_bound):
+    """
+    Binary search message IDs for the first one whose date is
+    >= target_date. Relies on IDs increasing with time, which
+    holds for a normal (non-merged) channel.
+    """
+
+    lo, hi, result = 1, hi_bound, hi_bound
+
+    while lo <= hi:
+
+        mid = (lo + hi) // 2
+
+        msg = await find_message_near_id(chat, mid)
+
+        if not msg or not msg.date:
+            hi = mid - 1
+            continue
+
+        msg_date = msg.date
+
+        if msg_date.tzinfo is None:
+
+            msg_date = msg_date.replace(
+                tzinfo=timezone.utc
+            )
+
+        if msg_date < target_date:
+            lo = mid + 1
+        else:
+            result = mid
+            hi = mid - 1
+
+        await asyncio.sleep(0.05)
+
+    return result
+
+
+async def find_backup_message(
+    chat,
+    latest_id,
+    tag="#USER_BACKUP",
+    batch_size=100,
+    max_batches=200
+):
+    """
+    Replaces bot.iter_messages(chat, search=tag) which bots
+    can't use. Scans backward in ID batches (newest first,
+    since backups are re-uploaded periodically) looking for a
+    document whose caption contains `tag`.
+    """
+
+    if not latest_id:
+        return None
+
+    end = latest_id
+    batches_checked = 0
+
+    while end >= 1 and batches_checked < max_batches:
+
+        start = max(1, end - batch_size + 1)
+        batch_ids = list(range(start, end + 1))
+
+        messages = await get_messages_by_ids(chat, batch_ids)
+
+        for msg in reversed(messages):
+
+            if (
+                msg
+                and msg.document
+                and msg.text
+                and tag in msg.text
+            ):
+                return msg
+
+        end = start - 1
+        batches_checked += 1
+
+        await asyncio.sleep(0.2)
+
+    return None
+
+
+# ============================================================
 # TELEGRAM DATABASE BACKUP
 # ============================================================
 async def sync_database_from_tg():
@@ -852,72 +1061,74 @@ async def sync_database_from_tg():
             "bot_users.restore.db"
         )
 
-        async for msg in bot.iter_messages(
+        latest_id = await find_latest_message_id(
+            DB_CHANNEL_ID
+        )
+
+        msg = await find_backup_message(
             DB_CHANNEL_ID,
-            search="#USER_BACKUP",
-            limit=1
-        ):
+            latest_id
+        )
 
-            if not msg.document:
-                continue
-
-            await bot.download_media(
-                msg.document,
-                file=backup_path
-            )
-
-            if not os.path.exists(
-                backup_path
-            ):
-                continue
-
-            # Validate SQLite database before replacing
-            try:
-
-                test_conn = sqlite3.connect(
-                    backup_path
-                )
-
-                test_conn.execute(
-                    "PRAGMA integrity_check"
-                )
-
-                test_conn.close()
-
-            except Exception as e:
-
-                print(
-                    f"❌ Backup validation failed: {e}"
-                )
-
-                try:
-                    os.remove(
-                        backup_path
-                    )
-                except Exception:
-                    pass
-
-                return
-
-            # Close current connection first.
-            try:
-                sqlite_conn.close()
-            except Exception:
-                pass
-
-            os.replace(
-                backup_path,
-                "bot_users.db"
-            )
+        if not msg:
 
             print(
-                "✅ Database backup restored."
+                "ℹ️ No previous database backup found."
             )
 
             return
 
+        await bot.download_media(
+            msg.document,
+            file=backup_path
+        )
+
+        if not os.path.exists(
+            backup_path
+        ):
+            return
+
+        # Validate SQLite database before replacing
+        try:
+
+            test_conn = sqlite3.connect(
+                backup_path
+            )
+
+            test_conn.execute(
+                "PRAGMA integrity_check"
+            )
+
+            test_conn.close()
+
+        except Exception as e:
+
+            print(
+                f"❌ Backup validation failed: {e}"
+            )
+
+            try:
+                os.remove(
+                    backup_path
+                )
+            except Exception:
+                pass
+
+            return
+
+        # Close current connection first.
+        try:
+            sqlite_conn.close()
+        except Exception:
+            pass
+
+        os.replace(
+            backup_path,
+            "bot_users.db"
+        )
+
         print(
-            "ℹ️ No previous database backup found."
+            "✅ Database backup restored."
         )
 
     except Exception as e:
@@ -952,13 +1163,19 @@ async def backup_database_to_tg():
         except Exception:
             pass
 
-        async for msg in bot.iter_messages(
+        latest_id = await find_latest_message_id(
+            DB_CHANNEL_ID
+        )
+
+        old_backup = await find_backup_message(
             DB_CHANNEL_ID,
-            search="#USER_BACKUP"
-        ):
+            latest_id
+        )
+
+        if old_backup:
 
             try:
-                await msg.delete()
+                await old_backup.delete()
 
             except Exception:
                 pass
@@ -1825,12 +2042,20 @@ async def send_public_card(
     poster_path=None
 ):
 
+    if not FORCE_SUB_CHANNEL:
+
+        raise RuntimeError(
+            "FORCE_SUB_CHANNEL is not configured, "
+            "so there is no public channel to post "
+            "cards to."
+        )
+
     if poster_path:
 
         try:
 
             public_msg = await bot.send_file(
-                DB_CHANNEL_ID,
+                FORCE_SUB_CHANNEL,
                 poster_path,
                 caption=caption,
                 buttons=buttons
@@ -1854,7 +2079,7 @@ async def send_public_card(
     else:
 
         public_msg = await bot.send_message(
-            DB_CHANNEL_ID,
+            FORCE_SUB_CHANNEL,
             caption,
             buttons=buttons
         )
@@ -2403,130 +2628,72 @@ async def migrate_by_range(
             )
 
 
-async def migrate_by_date(
-    start_date,
-    end_date,
-    status_msg
-):
+# ============================================================
+# DUPLICATE UPDATE GUARD
+#
+# Telegram / Telethon's own retry logic can occasionally
+# redeliver the same update more than once - after a reconnect,
+# on a flaky connection, or if more than one instance of this
+# bot is accidentally running against the same bot token (very
+# common right after a redeploy on some hosts). This blocks a
+# message from being handled twice.
+#
+# Registered as the very FIRST NewMessage handler: Telethon
+# calls handlers in registration order, and raising
+# StopPropagation here prevents every handler below it from
+# running again for a message we've already processed.
+# ============================================================
+_SEEN_EVENTS = {}
+_SEEN_EVENTS_LOCK = asyncio.Lock()
+_SEEN_TTL_SECONDS = 60
+_SEEN_MAX_ENTRIES = 2000
 
-    if MIGRATION_LOCK.locked():
 
-        await status_msg.edit(
-            "⚠️ A migration is already running."
-        )
+async def _is_duplicate_event(chat_id, msg_id):
 
-        return
+    key = (chat_id, msg_id)
+    now = time.time()
 
-    async with MIGRATION_LOCK:
+    async with _SEEN_EVENTS_LOCK:
 
-        migrated = 0
-        skipped = 0
-        failed = 0
-        checked = 0
+        if len(_SEEN_EVENTS) > _SEEN_MAX_ENTRIES:
 
-        try:
+            cutoff = now - _SEEN_TTL_SECONDS
 
-            if end_date is None:
-
-                end_date = now_utc()
-
-            async for public_msg in bot.iter_messages(
-                PUBLIC_DB_CHANNEL_ID,
-                offset_date=end_date,
-                reverse=False
+            for old_key, seen_at in list(
+                _SEEN_EVENTS.items()
             ):
 
-                if not public_msg.date:
-                    continue
+                if seen_at < cutoff:
+                    del _SEEN_EVENTS[old_key]
 
-                message_date = (
-                    public_msg.date
-                )
+        seen_at = _SEEN_EVENTS.get(key)
 
-                if message_date.tzinfo is None:
+        if (
+            seen_at is not None
+            and (now - seen_at) < _SEEN_TTL_SECONDS
+        ):
+            return True
 
-                    message_date = (
-                        message_date.replace(
-                            tzinfo=timezone.utc
-                        )
-                    )
+        _SEEN_EVENTS[key] = now
 
-                if (
-                    message_date
-                    < start_date
-                ):
+        return False
 
-                    break
 
-                checked += 1
+@bot.on(events.NewMessage())
+async def duplicate_guard_handler(event):
 
-                if not public_msg.media:
+    if await _is_duplicate_event(
+        event.chat_id,
+        event.id
+    ):
 
-                    skipped += 1
-                    continue
+        print(
+            f"⚠️ Ignored duplicate update: "
+            f"chat={event.chat_id} msg={event.id}"
+        )
 
-                # STRICT VIDEO ONLY
-                if not is_video_message(
-                    public_msg
-                ):
-
-                    skipped += 1
-                    continue
-
-                if is_public_message_migrated(
-                    public_msg.id
-                ):
-
-                    skipped += 1
-                    continue
-
-                ok, private_id = (
-                    await migrate_message(
-                        public_msg,
-                        status_msg
-                    )
-                )
-
-                if ok:
-
-                    migrated += 1
-
-                elif private_id:
-
-                    skipped += 1
-
-                else:
-
-                    failed += 1
-
-                if checked % 10 == 0:
-
-                    await status_msg.edit(
-                        "🔄 **Date Migration Running**\n\n"
-                        f"📊 Checked: `{checked}`\n"
-                        f"🎬 Videos: `{migrated}`\n"
-                        f"⏭️ Skipped: `{skipped}`\n"
-                        f"❌ Failed: `{failed}`"
-                    )
-
-                await asyncio.sleep(
-                    0.15
-                )
-
-            await status_msg.edit(
-                "✅ **Date Migration Complete**\n\n"
-                f"📊 Checked: `{checked}`\n"
-                f"🎬 Videos migrated: "
-                f"`{migrated}`\n"
-                f"⏭️ Skipped: `{skipped}`\n"
-                f"❌ Failed: `{failed}`"
-            )
-
-        except Exception as e:
-
-            await status_msg.edit(
-                f"❌ Date migration failed:\n`{e}`"
-            )
+        raise events.StopPropagation
 
 
 # ============================================================
@@ -2611,13 +2778,48 @@ async def migrate_handler(event):
             )
 
         status = await event.reply(
-            "🚀 **Starting video migration...**"
+            "🔍 **Locating message range "
+            "for that date...**"
+        )
+
+        latest_id = await find_latest_message_id(
+            PUBLIC_DB_CHANNEL_ID
+        )
+
+        if not latest_id:
+
+            return await status.edit(
+                "❌ Could not resolve any messages "
+                "in the public DB."
+            )
+
+        start_id = await find_id_for_date(
+            PUBLIC_DB_CHANNEL_ID,
+            start_date,
+            latest_id
+        )
+
+        end_id = (
+            await find_id_for_date(
+                PUBLIC_DB_CHANNEL_ID,
+                end_date,
+                latest_id
+            )
+            if end_date
+            else latest_id
+        )
+
+        await status.edit(
+            "🚀 **Starting migration**\n\n"
+            f"📅 Resolved to ID range:\n"
+            f"From: `{start_id}`\n"
+            f"To: `{end_id}`"
         )
 
         asyncio.create_task(
-            migrate_by_date(
-                start_date,
-                end_date,
+            migrate_by_range(
+                start_id,
+                end_id,
                 status
             )
         )
@@ -2665,45 +2867,20 @@ async def migrate_handler(event):
             "in public DB..."
         )
 
-        try:
+        oldest_msg = await find_message_near_id(
+            PUBLIC_DB_CHANNEL_ID,
+            1,
+            max_probe=50
+        )
 
-            oldest = await bot.get_messages(
-                PUBLIC_DB_CHANNEL_ID,
-                limit=1,
-                reverse=True
-            )
-
-            if isinstance(
-                oldest,
-                list
-            ):
-
-                if not oldest:
-
-                    return await status.edit(
-                        "❌ Public DB is empty."
-                    )
-
-                oldest_id = oldest[0].id
-
-            else:
-
-                if not oldest:
-
-                    return await status.edit(
-                        "❌ Public DB is empty."
-                    )
-
-                oldest_id = oldest.id
-
-            end_id = oldest_id
-
-        except Exception as e:
+        if not oldest_msg:
 
             return await status.edit(
-                "❌ Could not inspect "
-                f"public DB:\n`{e}`"
+                "❌ Public DB is empty "
+                "or unreachable."
             )
+
+        end_id = oldest_msg.id
 
         await status.edit(
             f"🚀 **Starting downward migration**\n\n"
@@ -3624,63 +3801,108 @@ async def index_vault_handler(event):
         return
 
     status = await event.reply(
-        "🔄 **Starting video vault indexing...**"
+        "🔍 **Locating newest message in vault...**"
     )
 
     count = 0
     skipped = 0
+    checked = 0
 
     try:
 
-        async for msg in bot.iter_messages(
-            DB_CHANNEL_ID,
-            limit=None
+        latest_id = await find_latest_message_id(
+            DB_CHANNEL_ID
+        )
+
+        if not latest_id:
+
+            return await status.edit(
+                "❌ Could not resolve any messages "
+                "in the vault."
+            )
+
+        await status.edit(
+            "🔄 **Starting video vault indexing...**\n\n"
+            f"📈 Scanning IDs `1` → `{latest_id}`"
+        )
+
+        batch_size = 100
+
+        for batch_start in range(
+            1,
+            latest_id + 1,
+            batch_size
         ):
 
-            if not msg or not msg.media:
-
-                skipped += 1
-                continue
-
-            # STRICT VIDEO CHECK
-            if not is_video_message(
-                msg
-            ):
-
-                skipped += 1
-                continue
-
-            file_name = (
-                get_message_filename_or_fallback(
-                    msg
+            batch_ids = list(
+                range(
+                    batch_start,
+                    min(
+                        batch_start + batch_size,
+                        latest_id + 1
+                    )
                 )
             )
 
-            if not file_name:
+            messages = await get_messages_by_ids(
+                DB_CHANNEL_ID,
+                batch_ids
+            )
 
-                skipped += 1
-                continue
+            for msg in messages:
 
-            if not is_video_filename(
-                file_name
-            ):
+                checked += 1
 
-                skipped += 1
-                continue
+                if not msg or not msg.media:
 
-            if add_vault_item(
-                msg.id,
-                file_name
-            ):
+                    skipped += 1
+                    continue
 
-                count += 1
+                # STRICT VIDEO CHECK
+                if not is_video_message(
+                    msg
+                ):
 
-            if count % 50 == 0:
+                    skipped += 1
+                    continue
+
+                file_name = (
+                    get_message_filename_or_fallback(
+                        msg
+                    )
+                )
+
+                if not file_name:
+
+                    skipped += 1
+                    continue
+
+                if not is_video_filename(
+                    file_name
+                ):
+
+                    skipped += 1
+                    continue
+
+                if add_vault_item(
+                    msg.id,
+                    file_name
+                ):
+
+                    count += 1
+
+            try:
 
                 await status.edit(
-                    f"🔄 Indexed `{count}` videos...\n"
+                    f"🔄 Checked `{checked}/{latest_id}`\n"
+                    f"🎬 Indexed: `{count}`\n"
                     f"⏭️ Skipped: `{skipped}`"
                 )
+
+            except Exception:
+                pass
+
+            await asyncio.sleep(0.3)
 
         await status.edit(
             f"✅ **Video Indexing Complete**\n\n"
