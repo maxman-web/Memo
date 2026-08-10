@@ -1,4 +1,3 @@
-
 import os
 import time
 import asyncio
@@ -6,57 +5,242 @@ import aiohttp
 import aiofiles
 import re
 import sqlite3
+import mimetypes
+from pathlib import Path
+from datetime import datetime, timezone
 from aiohttp import web
 from telethon import TelegramClient, events, Button, functions, types
 from telethon.network import ConnectionTcpIntermediate
 
+
+# ============================================================
+# OPTIONAL POSTGRES
+# ============================================================
 try:
     import psycopg2
+    from psycopg2.pool import SimpleConnectionPool
+
     HAS_POSTGRES_LIB = True
+
 except ImportError:
+    psycopg2 = None
+    SimpleConnectionPool = None
     HAS_POSTGRES_LIB = False
 
-# ==========================================
-# ⚙️ CONFIGURATION
-# ==========================================
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 str_api_id = os.environ.get("API_ID", "").strip()
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-DOOD_KEY = os.environ.get("DOOD_KEY", "").strip()  # kept for compatibility; unused
+
+DOOD_KEY = os.environ.get("DOOD_KEY", "").strip()
+
 WEBSITE_HOME = os.environ.get("WEBSITE_HOME", "").strip()
 CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip()
 BASE_URL = os.environ.get("BASE_URL", "").strip().rstrip("/")
+
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-auth_str = os.environ.get("AUTH_USERS", "").strip()
-AUTH_USERS = [int(x) for x in auth_str.split(",") if x.strip().isdigit()]
-FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "").strip()
+AUTH_USERS_RAW = os.environ.get("AUTH_USERS", "").strip()
+
+AUTH_USERS = [
+    int(x.strip())
+    for x in AUTH_USERS_RAW.split(",")
+    if x.strip().isdigit()
+]
+
+FORCE_SUB_CHANNEL = os.environ.get(
+    "FORCE_SUB_CHANNEL",
+    ""
+).strip()
+
+
+# ============================================================
+# OPTIONAL PERFORMANCE CONFIG
+# ============================================================
+QUEUE_WORKERS = max(
+    1,
+    int(
+        os.environ.get(
+            "QUEUE_WORKERS",
+            "1"
+        )
+    )
+)
+
+STREAM_CONCURRENCY = max(
+    1,
+    int(
+        os.environ.get(
+            "STREAM_CONCURRENCY",
+            "8"
+        )
+    )
+)
+
+STREAM_CHUNK_SIZE = max(
+    64 * 1024,
+    int(
+        os.environ.get(
+            "STREAM_CHUNK_SIZE",
+            str(1024 * 1024)
+        )
+    )
+)
+
+AUTO_DELETE_SECONDS = max(
+    30,
+    int(
+        os.environ.get(
+            "AUTO_DELETE_SECONDS",
+            "300"
+        )
+    )
+)
+
+
 if FORCE_SUB_CHANNEL.replace("-", "").isdigit():
     FORCE_SUB_CHANNEL = int(FORCE_SUB_CHANNEL)
 
-WORK_QUEUE = asyncio.Queue()
 
-def parse_id(val):
-    val = str(val).strip()
-    if not val:
+# ============================================================
+# CHANNEL IDs
+#
+# DB_CHANNEL_ID:
+#   PRIVATE DESTINATION / REAL BOT VAULT
+#
+# PUBLIC_DB_CHANNEL_ID:
+#   PUBLIC MIGRATION SOURCE
+# ============================================================
+def parse_id(value):
+    value = str(value).strip()
+
+    if not value:
         return 0
-    if val.startswith("@"):
-        return val
+
+    if value.startswith("@"):
+        return value
+
     try:
-        return int(val)
+        return int(value)
+
     except ValueError:
         return 0
 
-DB_CHANNEL_ID = parse_id(os.environ.get("DB_CHANNEL_ID", "0"))
-PUBLIC_CHANNEL_ID = parse_id(os.environ.get("PUBLIC_CHANNEL_ID", "0"))
 
+DB_CHANNEL_ID = parse_id(
+    os.environ.get(
+        "DB_CHANNEL_ID",
+        "0"
+    )
+)
+
+PUBLIC_DB_CHANNEL_ID = parse_id(
+    os.environ.get(
+        "PUBLIC_DB_CHANNEL_ID",
+        "0"
+    )
+)
+
+
+# ============================================================
+# BASIC VALIDATION
+# ============================================================
 if not str_api_id:
     print("❌ API_ID is missing!")
     raise SystemExit(1)
 
-API_ID = int(str_api_id)
+if not API_HASH:
+    print("❌ API_HASH is missing!")
+    raise SystemExit(1)
 
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN is missing!")
+    raise SystemExit(1)
+
+if not DB_CHANNEL_ID:
+    print("❌ DB_CHANNEL_ID is missing!")
+    raise SystemExit(1)
+
+
+try:
+    API_ID = int(str_api_id)
+
+except ValueError:
+    print("❌ API_ID must be a number!")
+    raise SystemExit(1)
+
+
+# ============================================================
+# VIDEO FORMAT POLICY
+#
+# ONLY THESE EXTENSIONS ARE ACCEPTED.
+#
+# Images:
+#   jpg/png/webp/gif -> rejected
+#
+# Documents:
+#   pdf/zip/doc/txt -> rejected
+#
+# Subtitles:
+#   srt/ass/sub -> rejected
+# ============================================================
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".m4v",
+    ".ts",
+    ".mts",
+    ".m2ts",
+    ".mpeg",
+    ".mpg",
+    ".3gp",
+    ".3g2",
+    ".flv",
+    ".wmv",
+    ".asf",
+    ".ogv",
+    ".vob",
+    ".rm",
+    ".rmvb",
+}
+
+VIDEO_MIME_TYPES = {
+    "video/mp4",
+    "video/x-matroska",
+    "video/webm",
+    "video/quicktime",
+    "video/x-msvideo",
+    "video/x-ms-wmv",
+    "video/mpeg",
+    "video/3gpp",
+    "video/x-flv",
+    "video/ogg",
+    "video/mp2t",
+}
+
+
+# ============================================================
+# QUEUES / LOCKS
+# ============================================================
+WORK_QUEUE = asyncio.Queue()
+
+MIGRATION_LOCK = asyncio.Lock()
+
+STREAM_SEMAPHORE = asyncio.Semaphore(
+    STREAM_CONCURRENCY
+)
+
+
+# ============================================================
+# TELEGRAM CLIENT
+# ============================================================
 bot = TelegramClient(
     "MaxCinema_Render_Session",
     API_ID,
@@ -69,945 +253,4514 @@ bot = TelegramClient(
 
 print("✅ Bot is Starting...")
 
-# Globals initialized later
-USE_POSTGRES = bool(DATABASE_URL and HAS_POSTGRES_LIB)
-sqlite_conn = None
-sqlite_cursor = None
-PG_INITIALIZED = False
-SQLITE_INITIALIZED = False
 
-# ==========================================
-# 🧠 SMART FILENAME & META PARSER
-# ==========================================
+# ============================================================
+# HELPERS
+# ============================================================
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def human_size(size):
+    if size is None:
+        return "Unknown"
+
+    try:
+        size = float(size)
+
+    except Exception:
+        return "Unknown"
+
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+        "TB"
+    ]
+
+    for unit in units:
+
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+
+        size /= 1024
+
+    return f"{size:.2f} PB"
+
+
+def sanitize_filename(name):
+    """
+    Make filenames safe for local storage.
+    """
+
+    if not name:
+        return "video.mp4"
+
+    name = str(name).strip()
+
+    # Remove path traversal
+    name = name.replace(
+        "\\",
+        "_"
+    )
+
+    name = name.replace(
+        "/",
+        "_"
+    )
+
+    name = re.sub(
+        r"[\x00-\x1f\x7f]",
+        "_",
+        name
+    )
+
+    name = re.sub(
+        r'[<>:"|?*]',
+        "_",
+        name
+    )
+
+    name = re.sub(
+        r"\s+",
+        " ",
+        name
+    ).strip()
+
+    if not name:
+        name = "video.mp4"
+
+    return name[:240]
+
+
+def get_extension(name):
+    if not name:
+        return ""
+
+    return Path(
+        str(name).strip()
+    ).suffix.lower()
+
+
+def is_video_filename(name):
+    """
+    Strict video filename validation.
+    """
+
+    if not name:
+        return False
+
+    return (
+        get_extension(name)
+        in VIDEO_EXTENSIONS
+    )
+
+
+def is_video_mime(mime):
+    if not mime:
+        return False
+
+    mime = str(
+        mime
+    ).lower().split(
+        ";",
+        1
+    )[0].strip()
+
+    return mime.startswith(
+        "video/"
+    ) or mime in VIDEO_MIME_TYPES
+
+
+def is_video_message(msg):
+    """
+    Strict Telegram media validation.
+
+    A Telegram document is accepted only when:
+      1. It has a known video extension, OR
+      2. Telegram explicitly reports a video MIME type.
+
+    Photos and text are NEVER accepted.
+    """
+
+    if not msg:
+        return False
+
+    # Telegram native video
+    if getattr(msg, "video", None):
+        return True
+
+    document = getattr(
+        msg,
+        "document",
+        None
+    )
+
+    if not document:
+        return False
+
+    mime_type = getattr(
+        document,
+        "mime_type",
+        None
+    )
+
+    if is_video_mime(
+        mime_type
+    ):
+        return True
+
+    file_name = get_message_filename(
+        msg
+    )
+
+    return is_video_filename(
+        file_name
+    )
+
+
+# ============================================================
+# SMART FILENAME / META PARSER
+# ============================================================
 def parse_media_meta(file_name):
+
     if not file_name:
-        return "Unknown File", "movie", None, None
 
-    clean_name = re.sub(r"[._-]", " ", str(file_name)).strip()
-    clean_name = re.sub(r"\s+", " ", clean_name)
+        return (
+            "Unknown File",
+            "movie",
+            None,
+            None
+        )
 
-    pattern_se = re.search(r"(.*?)\bS(\d{1,2})\s*E(\d{1,3})\b", clean_name, re.IGNORECASE)
-    if pattern_se:
-        title = pattern_se.group(1).strip()
-        return title, "series", int(pattern_se.group(2)), int(pattern_se.group(3))
+    clean_name = re.sub(
+        r"[._-]",
+        " ",
+        str(file_name)
+    ).strip()
 
-    pattern_x = re.search(r"(.*?)\b(\d{1,2})x(\d{1,3})\b", clean_name, re.IGNORECASE)
-    if pattern_x:
-        title = pattern_x.group(1).strip()
-        return title, "series", int(pattern_x.group(2)), int(pattern_x.group(3))
+    clean_name = re.sub(
+        r"\s+",
+        " ",
+        clean_name
+    )
 
-    pattern_ep = re.search(r"(.*?)\b(?:Ep|Episode)\s*(\d{1,3})\b", clean_name, re.IGNORECASE)
-    if pattern_ep:
-        title = pattern_ep.group(1).strip()
-        return title, "series", 1, int(pattern_ep.group(2))
+    # --------------------------------------------------------
+    # S01E02
+    # --------------------------------------------------------
+    match = re.search(
+        r"(.*?)\bS(\d{1,2})\s*E(\d{1,3})\b",
+        clean_name,
+        re.IGNORECASE
+    )
 
+    if match:
+
+        title = match.group(
+            1
+        ).strip()
+
+        return (
+            title,
+            "series",
+            int(match.group(2)),
+            int(match.group(3))
+        )
+
+    # --------------------------------------------------------
+    # 1x02
+    # --------------------------------------------------------
+    match = re.search(
+        r"(.*?)\b(\d{1,2})x(\d{1,3})\b",
+        clean_name,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        title = match.group(
+            1
+        ).strip()
+
+        return (
+            title,
+            "series",
+            int(match.group(2)),
+            int(match.group(3))
+        )
+
+    # --------------------------------------------------------
+    # Episode 02 / Ep 02
+    # --------------------------------------------------------
+    match = re.search(
+        r"(.*?)\b(?:Ep|Episode)\s*(\d{1,3})\b",
+        clean_name,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        title = match.group(
+            1
+        ).strip()
+
+        return (
+            title,
+            "series",
+            1,
+            int(match.group(2))
+        )
+
+    # --------------------------------------------------------
+    # Remove common release metadata
+    # --------------------------------------------------------
     movie_title = re.sub(
-        r"\b(1080p|720p|4k|hdr|web\s*dl|bluray|x264|h264|x265|hevc|hindi|english|dual\s*audio)\b.*",
+        r"\b("
+        r"1080p|720p|2160p|4320p|4k|"
+        r"hdr|hdr10|web\s*dl|webdl|web-rip|webrip|"
+        r"bluray|blu-ray|brrip|dvdrip|"
+        r"x264|h264|x265|h265|hevc|av1|"
+        r"hindi|english|dual\s*audio|multi\s*audio|"
+        r"proper|repack|remux"
+        r")\b.*",
         "",
         clean_name,
         flags=re.IGNORECASE
     ).strip()
-    return movie_title or clean_name, "movie", None, None
 
-def is_media_filename(name: str) -> bool:
-    if not name:
-        return False
-    name = name.lower().strip()
-    return bool(re.search(r"\.(mp4|mkv|avi|mov|webm|m4v|srt|ass|sub)$", name))
+    return (
+        movie_title or clean_name,
+        "movie",
+        None,
+        None
+    )
 
-# ==========================================
-# 💾 DATABASE INITIALIZATION
-# ==========================================
-def init_postgres():
-    global PG_INITIALIZED
-    if PG_INITIALIZED or not USE_POSTGRES:
-        return
 
-    def get_pg_conn():
-        return psycopg2.connect(DATABASE_URL)
+# ============================================================
+# DATABASE
+# ============================================================
+USE_POSTGRES = bool(
+    DATABASE_URL
+    and HAS_POSTGRES_LIB
+)
 
-    globals()["get_pg_conn"] = get_pg_conn
+
+PG_POOL = None
+
+
+# ============================================================
+# POSTGRES
+# ============================================================
+if USE_POSTGRES:
+
+    print("🐘 Database Mode: PostgreSQL")
 
     try:
-        with get_pg_conn() as conn:
+
+        PG_MIN = max(
+            1,
+            int(
+                os.environ.get(
+                    "PG_MIN_CONNECTIONS",
+                    "1"
+                )
+            )
+        )
+
+        PG_MAX = max(
+            PG_MIN,
+            int(
+                os.environ.get(
+                    "PG_MAX_CONNECTIONS",
+                    "5"
+                )
+            )
+        )
+
+        PG_POOL = SimpleConnectionPool(
+            PG_MIN,
+            PG_MAX,
+            DATABASE_URL
+        )
+
+        conn = PG_POOL.getconn()
+
+        try:
+
             with conn.cursor() as cursor:
-                cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
-                cursor.execute("""
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        created_at TIMESTAMPTZ
+                        DEFAULT NOW()
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS vault (
                         msg_id BIGINT PRIMARY KEY,
                         file_name TEXT,
                         title TEXT,
                         media_type TEXT,
                         season INTEGER,
-                        episode INTEGER
+                        episode INTEGER,
+                        created_at TIMESTAMPTZ
+                        DEFAULT NOW()
                     )
-                """)
-                cursor.execute("""
+                    """
+                )
+
+                cursor.execute(
+                    """
                     CREATE TABLE IF NOT EXISTS vault_map (
                         public_msg_id BIGINT PRIMARY KEY,
                         vault_msg_id BIGINT NOT NULL
                     )
-                """)
-                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS title TEXT")
-                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS media_type TEXT")
-                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS season INTEGER")
-                cursor.execute("ALTER TABLE vault ADD COLUMN IF NOT EXISTS episode INTEGER")
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE vault
+                    ADD COLUMN IF NOT EXISTS
+                    title TEXT
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE vault
+                    ADD COLUMN IF NOT EXISTS
+                    media_type TEXT
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE vault
+                    ADD COLUMN IF NOT EXISTS
+                    season INTEGER
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE vault
+                    ADD COLUMN IF NOT EXISTS
+                    episode INTEGER
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_vault_title
+                    ON vault(title)
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_vault_media_type
+                    ON vault(media_type)
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                    idx_vault_season_episode
+                    ON vault(
+                        season,
+                        episode
+                    )
+                    """
+                )
+
                 conn.commit()
-        PG_INITIALIZED = True
-        print("🐘 Database Mode: Cloud PostgreSQL Connected!")
+
+        finally:
+
+            PG_POOL.putconn(
+                conn
+            )
+
+        print(
+            "✅ PostgreSQL tables ready."
+        )
+
     except Exception as e:
-        print(f"❌ PostgreSQL Table Alteration/Init Failed: {e}. Falling back to SQLite.")
-        globals()["USE_POSTGRES"] = False
 
-def init_sqlite():
-    global sqlite_conn, sqlite_cursor, SQLITE_INITIALIZED
-    if SQLITE_INITIALIZED:
-        return
+        print(
+            f"❌ PostgreSQL initialization failed: {e}"
+        )
 
-    print("💾 Database Mode: SQLite + Telegram Vault Sync (Render Free Tier Engine)")
-    sqlite_conn = sqlite3.connect("bot_users.db", check_same_thread=False)
+        USE_POSTGRES = False
+        PG_POOL = None
+
+
+# ============================================================
+# SQLITE
+# ============================================================
+if not USE_POSTGRES:
+
+    print(
+        "💾 Database Mode: SQLite + Telegram Backup"
+    )
+
+    sqlite_conn = sqlite3.connect(
+        "bot_users.db",
+        check_same_thread=False,
+        timeout=30
+    )
+
+    sqlite_conn.row_factory = sqlite3.Row
+
     sqlite_cursor = sqlite_conn.cursor()
 
-    sqlite_cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-    sqlite_cursor.execute("""
+    try:
+
+        sqlite_cursor.execute(
+            "PRAGMA journal_mode=WAL"
+        )
+
+        sqlite_cursor.execute(
+            "PRAGMA synchronous=NORMAL"
+        )
+
+        sqlite_cursor.execute(
+            "PRAGMA busy_timeout=30000"
+        )
+
+    except Exception:
+        pass
+
+    sqlite_cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            created_at TEXT
+            DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    sqlite_cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS vault (
             msg_id INTEGER PRIMARY KEY,
             file_name TEXT,
             title TEXT,
             media_type TEXT,
             season INTEGER,
-            episode INTEGER
+            episode INTEGER,
+            created_at TEXT
+            DEFAULT CURRENT_TIMESTAMP
         )
-    """)
-    sqlite_cursor.execute("""
+        """
+    )
+
+    sqlite_cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS vault_map (
             public_msg_id INTEGER PRIMARY KEY,
             vault_msg_id INTEGER NOT NULL
         )
-    """)
-    sqlite_conn.commit()
-    SQLITE_INITIALIZED = True
+        """
+    )
 
+    sqlite_cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_vault_title
+        ON vault(title)
+        """
+    )
+
+    sqlite_cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_vault_media_type
+        ON vault(media_type)
+        """
+    )
+
+    sqlite_cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_vault_season_episode
+        ON vault(
+            season,
+            episode
+        )
+        """
+    )
+
+    sqlite_cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_vault_map_vault
+        ON vault_map(vault_msg_id)
+        """
+    )
+
+    sqlite_conn.commit()
+
+
+# ============================================================
+# DATABASE CONNECTION HELPERS
+# ============================================================
+def get_pg_conn():
+
+    if not PG_POOL:
+        raise RuntimeError(
+            "PostgreSQL pool is unavailable."
+        )
+
+    return PG_POOL.getconn()
+
+
+def release_pg_conn(conn):
+
+    if PG_POOL and conn:
+        PG_POOL.putconn(
+            conn
+        )
+
+
+# ============================================================
+# TELEGRAM DATABASE BACKUP
+# ============================================================
 async def sync_database_from_tg():
-    """Restores the database file from Telegram on startup (SQLite Only)"""
+
     if USE_POSTGRES:
         return
+
     try:
-        print("🔄 Syncing user database from Telegram Vault...")
-        async for msg in bot.iter_messages(DB_CHANNEL_ID, search="#USER_BACKUP", limit=1):
-            if msg and msg.document:
-                if os.path.exists("bot_users.db"):
-                    try:
-                        os.remove("bot_users.db")
-                    except Exception:
-                        pass
-                await bot.download_media(msg.document, file="bot_users.db")
-                print("✅ Database synced successfully from Telegram!")
+
+        print(
+            "🔄 Looking for SQLite backup..."
+        )
+
+        backup_path = (
+            "bot_users.restore.db"
+        )
+
+        async for msg in bot.iter_messages(
+            DB_CHANNEL_ID,
+            search="#USER_BACKUP",
+            limit=1
+        ):
+
+            if not msg.document:
+                continue
+
+            await bot.download_media(
+                msg.document,
+                file=backup_path
+            )
+
+            if not os.path.exists(
+                backup_path
+            ):
+                continue
+
+            # Validate SQLite database before replacing
+            try:
+
+                test_conn = sqlite3.connect(
+                    backup_path
+                )
+
+                test_conn.execute(
+                    "PRAGMA integrity_check"
+                )
+
+                test_conn.close()
+
+            except Exception as e:
+
+                print(
+                    f"❌ Backup validation failed: {e}"
+                )
+
+                try:
+                    os.remove(
+                        backup_path
+                    )
+                except Exception:
+                    pass
+
                 return
-        print("ℹ️ No previous database backup found. Starting fresh.")
+
+            # Close current connection first.
+            try:
+                sqlite_conn.close()
+            except Exception:
+                pass
+
+            os.replace(
+                backup_path,
+                "bot_users.db"
+            )
+
+            print(
+                "✅ Database backup restored."
+            )
+
+            return
+
+        print(
+            "ℹ️ No previous database backup found."
+        )
+
     except Exception as e:
-        print(f"❌ Backup sync failed: {e}")
+
+        print(
+            f"❌ Database sync failed: {e}"
+        )
+
 
 async def backup_database_to_tg():
-    """Backs up the SQLite database file to your private channel (SQLite Only)"""
+
     if USE_POSTGRES:
         return
-    try:
-        if os.path.exists("bot_users.db"):
-            async for msg in bot.iter_messages(DB_CHANNEL_ID, search="#USER_BACKUP"):
-                await msg.delete()
 
-            await bot.send_file(
-                DB_CHANNEL_ID,
-                "bot_users.db",
-                caption="💾 #USER_BACKUP\nDO NOT DELETE. Keeps your user broadcast list alive on Render's free tier."
+    try:
+
+        if not os.path.exists(
+            "bot_users.db"
+        ):
+            return
+
+        # Checkpoint WAL so the main DB contains
+        # recent changes before uploading it.
+        try:
+
+            sqlite_cursor.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
             )
-            print("✅ Database backup pushed to Telegram Vault!")
-    except Exception as e:
-        print(f"❌ Backup upload failed: {e}")
 
-def add_user(user_id):
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
-                        (user_id,)
-                    )
-                    conn.commit()
-        except Exception as e:
-            print(f"PostgreSQL Error adding user: {e}")
-    else:
-        try:
-            sqlite_cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
             sqlite_conn.commit()
-            if sqlite_cursor.rowcount > 0:
-                bot.loop.create_task(backup_database_to_tg())
-        except Exception as e:
-            print(f"SQLite Error adding user: {e}")
 
-def get_all_users():
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT user_id FROM users")
-                    return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            print(f"PostgreSQL Error fetching users: {e}")
-            return []
-    else:
-        try:
-            sqlite_cursor.execute("SELECT user_id FROM users")
-            return [row[0] for row in sqlite_cursor.fetchall()]
-        except Exception as e:
-            print(f"SQLite Error fetching users: {e}")
-            return []
-
-def add_vault_item(msg_id, file_name):
-    """Indexes structural file property details into the database"""
-    title, media_type, season, episode = parse_media_meta(file_name)
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO vault (msg_id, file_name, title, media_type, season, episode)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (msg_id) DO UPDATE
-                        SET file_name = EXCLUDED.file_name,
-                            title = EXCLUDED.title,
-                            media_type = EXCLUDED.media_type,
-                            season = EXCLUDED.season,
-                            episode = EXCLUDED.episode
-                    """, (msg_id, file_name, title, media_type, season, episode))
-                    conn.commit()
-        except Exception as e:
-            print(f"PostgreSQL Vault Indexing Error: {e}")
-    else:
-        try:
-            sqlite_cursor.execute("""
-                INSERT OR REPLACE INTO vault (msg_id, file_name, title, media_type, season, episode)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (msg_id, file_name, title, media_type, season, episode))
-            sqlite_conn.commit()
-            bot.loop.create_task(backup_database_to_tg())
-        except Exception as e:
-            print(f"SQLite Vault Indexing Error: {e}")
-
-def search_vault(query):
-    """Handles multi-word queries for better accuracy"""
-    words = query.strip().split()
-    if not words:
-        return []
-
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    conditions = " AND ".join(["(title ILIKE %s OR file_name ILIKE %s)" for _ in words])
-                    params = []
-                    for word in words:
-                        params.extend([f"%{word}%", f"%{word}%"])
-
-                    sql = f"""
-                        SELECT msg_id FROM vault
-                        WHERE {conditions}
-                        ORDER BY media_type DESC, season ASC, episode ASC NULLS LAST
-                        LIMIT 8
-                    """
-                    cursor.execute(sql, tuple(params))
-                    return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            print(f"PostgreSQL Search Error: {e}")
-            return []
-    else:
-        try:
-            conditions = " AND ".join(["(title LIKE ? OR file_name LIKE ?)" for _ in words])
-            params = []
-            for word in words:
-                params.extend([f"%{word}%", f"%{word}%"])
-
-            sql = f"""
-                SELECT msg_id FROM vault
-                WHERE {conditions}
-                ORDER BY media_type DESC, season ASC, episode ASC
-                LIMIT 8
-            """
-            sqlite_cursor.execute(sql, tuple(params))
-            return [row[0] for row in sqlite_cursor.fetchall()]
-        except Exception as e:
-            print(f"SQLite Search Error: {e}")
-            return []
-
-async def get_vault_message(vault_id: int):
-    try:
-        msg = await bot.get_messages(DB_CHANNEL_ID, ids=vault_id)
-        if msg and msg.media:
-            return msg
-    except Exception:
-        pass
-    return None
-
-def save_public_mapping(public_msg_id: int, vault_msg_id: int):
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        INSERT INTO vault_map (public_msg_id, vault_msg_id)
-                        VALUES (%s, %s)
-                        ON CONFLICT (public_msg_id)
-                        DO UPDATE SET vault_msg_id = EXCLUDED.vault_msg_id
-                    """, (public_msg_id, vault_msg_id))
-                    conn.commit()
-        except Exception as e:
-            print(f"PostgreSQL mapping error: {e}")
-    else:
-        try:
-            sqlite_cursor.execute("""
-                INSERT OR REPLACE INTO vault_map (public_msg_id, vault_msg_id)
-                VALUES (?, ?)
-            """, (public_msg_id, vault_msg_id))
-            sqlite_conn.commit()
-        except Exception as e:
-            print(f"SQLite mapping error: {e}")
-
-def get_vault_id_from_public(public_msg_id: int):
-    if USE_POSTGRES:
-        try:
-            with get_pg_conn() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT vault_msg_id FROM vault_map WHERE public_msg_id = %s", (public_msg_id,))
-                    row = cursor.fetchone()
-                    return row[0] if row else None
-        except Exception:
-            return None
-    else:
-        try:
-            sqlite_cursor.execute("SELECT vault_msg_id FROM vault_map WHERE public_msg_id = ?", (public_msg_id,))
-            row = sqlite_cursor.fetchone()
-            return row[0] if row else None
-        except Exception:
-            return None
-
-async def send_public_card(caption: str, buttons: list, poster_path: str | None = None):
-    if poster_path:
-        try:
-            public_msg = await bot.send_file(PUBLIC_CHANNEL_ID, poster_path, caption=caption, buttons=buttons)
-        finally:
-            try:
-                if os.path.exists(poster_path):
-                    os.remove(poster_path)
-            except Exception:
-                pass
-    else:
-        public_msg = await bot.send_message(PUBLIC_CHANNEL_ID, caption, buttons=buttons)
-    return public_msg
-
-# ==========================================
-# 🛠️ HELPER: CHECK SUBSCRIPTION
-# ==========================================
-async def check_subscription(user_id):
-    if not FORCE_SUB_CHANNEL:
-        return True
-    if user_id in AUTH_USERS:
-        return True
-    try:
-        await bot(functions.channels.GetParticipantRequest(
-            channel=FORCE_SUB_CHANNEL,
-            participant=user_id
-        ))
-        return True
-    except Exception:
-        return False
-
-# ==========================================
-# 🚦 QUEUE WORKER
-# ==========================================
-async def worker():
-    print("👷 Queue Worker Started")
-    while True:
-        task_data = await WORK_QUEUE.get()
-        event, source, name, thumb_path = task_data
-        try:
-            await process_task(event, source, name, thumb_path)
-        except Exception as e:
-            print(f"Task Failed: {e}")
-            try:
-                await event.reply(f"❌ Task Failed: {str(e)}")
-            except Exception:
-                pass
-        finally:
-            WORK_QUEUE.task_done()
-            await asyncio.sleep(2)
-
-# ==========================================
-# 📊 PROGRESS BAR
-# ==========================================
-async def progress_bar(current, total, status_msg, action_name, last_time_ref):
-    if total <= 0:
-        total = 1
-    now = time.time()
-    if now - last_time_ref[0] < 5:
-        return
-    percentage = current * 100 / total
-    filled = int(percentage / 10)
-    bar = "▓" * filled + "░" * (10 - filled)
-    try:
-        await status_msg.edit(f"{action_name}\n{bar} **{percentage:.1f}%**")
-        last_time_ref[0] = now
-    except Exception:
-        pass
-
-# ==========================================
-# 🧠 SMART DOWNLOADER
-# ==========================================
-async def smart_download(client, message, filename, progress_callback):
-    try:
-        await client.download_media(message, file=filename, progress_callback=progress_callback)
-        return True
-    except Exception:
-        pass
-    try:
-        if hasattr(message, "media") and hasattr(message.media, "document"):
-            await client.download_media(message.media.document, file=filename, progress_callback=progress_callback)
-            return True
-    except Exception:
-        pass
-    return False
-
-# ==========================================
-# 🌐 WEB SERVER
-# ==========================================
-async def stream_handler(request):
-    try:
-        msg_id = int(request.match_info["msg_id"])
-        message = await bot.get_messages(DB_CHANNEL_ID, ids=msg_id)
-        if not message or not message.file:
-            return web.Response(status=404, text="File not found")
-
-        file_name = "video.mp4"
-        if message.document:
-            for attr in message.document.attributes:
-                if isinstance(attr, types.DocumentAttributeFilename):
-                    file_name = attr.file_name
-                    break
-
-        file_size = message.document.size if message.document else 0
-        mime_type = (message.document.mime_type if message.document else None) or "application/octet-stream"
-
-        range_header = request.headers.get("Range")
-        start = 0
-        end = file_size - 1 if file_size else 0
-
-        if range_header:
-            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-            if match:
-                start = int(match.group(1))
-                if match.group(2):
-                    end = int(match.group(2))
-                else:
-                    end = file_size - 1 if file_size else 0
-
-        if file_size and start >= file_size:
-            return web.Response(status=416, text="Requested Range Not Satisfiable")
-
-        response = web.StreamResponse(status=206 if range_header else 200)
-        response.headers["Content-Type"] = mime_type
-        response.headers["Accept-Ranges"] = "bytes"
-        response.headers["Content-Disposition"] = f'inline; filename="{file_name}"'
-
-        remaining = (end - start) + 1 if file_size else 0
-        if remaining < 0:
-            remaining = 0
-        response.content_length = remaining if remaining else None
-
-        if range_header and file_size:
-            response.headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-
-        await response.prepare(request)
-
-        async for chunk in bot.iter_download(message.media, offset=start):
-            if file_size and remaining <= 0:
-                break
-            if file_size and len(chunk) > remaining:
-                chunk = chunk[:remaining]
-            await response.write(chunk)
-            if file_size:
-                remaining -= len(chunk)
-
-        return response
-    except Exception as e:
-        return web.Response(status=500, text=str(e))
-
-async def root_handler(request):
-    return web.Response(text="🚀 MaxCinema Bot is Running")
-
-# ==========================================
-# 🌟 HANDLERS
-# ==========================================
-@bot.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    sender = await event.get_sender()
-    if sender:
-        add_user(sender.id)
-
-    args = event.text.split()
-    is_joined = await check_subscription(sender.id)
-
-    if len(args) > 1:
-        param = args[1]
-
-        if not is_joined:
-            msg = "⛔ **Access Denied!**\n\nYou must join our main channel to download this file."
-            btn = [
-                [Button.url("📢 Join Channel", url=CHANNEL_LINK or "https://t.me/MaxCinemaOfficial")],
-                [Button.url("🔄 Try Again", url=f"https://t.me/{event.client.me.username}?start={param}")]
-            ]
-            return await event.reply(msg, buttons=btn)
-
-        status = await event.reply("📂 **Fetching your files...**")
-
-        if "pack_" in param:
-            try:
-                _, start_id, end_id = param.split("_")
-                ids_to_fetch = list(range(int(start_id), int(end_id) + 1))
-                found_any = False
-
-                for msg_id in ids_to_fetch:
-                    msg = await get_vault_message(msg_id)
-                    if msg:
-                        sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
-                        warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
-                        bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
-                        found_any = True
-
-                if found_any:
-                    await status.delete()
-                else:
-                    await status.edit("❌ Pack not found in the storage channel.")
-            except Exception:
-                await status.edit("❌ Pack not found.")
-        else:
-            try:
-                msg_id = int(param)
-                msg = await get_vault_message(msg_id)
-                if not msg:
-                    mapped_vault_id = get_vault_id_from_public(msg_id)
-                    if mapped_vault_id:
-                        msg = await get_vault_message(mapped_vault_id)
-
-                if msg and msg.media:
-                    sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
-                    warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
-                    bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
-                    await status.delete()
-                else:
-                    await status.edit("❌ File not found in the storage channel.")
-            except Exception:
-                await status.edit("❌ Error processing file.")
-        return
-
-    if AUTH_USERS and sender.id in AUTH_USERS:
-        admin_guide = (
-            "**👑 MAXCINEMA ADMIN GUIDE**\n\n"
-            "**1️⃣ MIRROR (Full)**\nReply `/mirror name.mp4`\n"
-            "**2️⃣ ADD (Instant)**\nReply `/add` to a video.\n"
-            "**3️⃣ POST (Auto)**\nReply Photo + `/post` to a bot message.\n"
-            "**4️⃣ POST ID (Manual)**\nPhoto Caption: `/postid 1234 Caption...`\n"
-            "**5️⃣ TMDB**\n`/tmdb Inception` to get movie details.\n"
-            "**6️⃣ BROADCAST**\n`/broadcast Message` to message all users.\n"
-            "**7️⃣ STATS**\n`/stats` to view DB users.\n"
-            "**8️⃣ INDEX ALL**\n`/indexvault` to backfill structured items."
-        )
-        await event.reply(admin_guide)
-    else:
-        welcome_text = "**👋 Welcome to MaxCinema Bot!**\n\nI store files for the main channel."
-        buttons = []
-        if CHANNEL_LINK:
-            buttons.append([Button.url("📢 Join Main Channel", url=CHANNEL_LINK)])
-        buttons.append([Button.inline("📝 Request a Movie", data="help_request")])
-        await event.reply(welcome_text, buttons=buttons)
-
-@bot.on(events.CallbackQuery(data="help_request"))
-async def callback_handler(event):
-    await event.answer("💡 TYPE:\n/request Name", alert=True)
-
-@bot.on(events.NewMessage(pattern="/request"))
-async def request_handler(event):
-    query = event.text.replace("/request", "").strip()
-    sender = await event.get_sender()
-
-    if not query:
-        return await event.reply("❌ Usage: `/request Movie Name`")
-
-    status = await event.reply(f"🔍 Searching Structured Index for `{query}`...")
-
-    try:
-        msg_ids = search_vault(query)
-
-        if msg_ids:
-            messages = await bot.get_messages(DB_CHANNEL_ID, ids=msg_ids)
-            if not isinstance(messages, list):
-                messages = [messages]
-
-            found = False
-            for msg in messages:
-                if msg and msg.media:
-                    sent_file = await bot.send_file(event.chat_id, msg.media, caption=msg.text)
-                    warning = await event.reply("⏳ **SECURITY:** *This file will auto-delete in 5 minutes to protect the bot.*")
-                    bot.loop.create_task(auto_delete_task(event, [sent_file, warning], delay=300))
-                    found = True
-
-            if found:
-                return await status.edit("✅ **Here is what I found sorted for you!**")
-
-        await status.edit("⚠️ Not found in database index. Forwarding request to admins...")
-        if AUTH_USERS:
-            for admin_id in AUTH_USERS:
-                try:
-                    await bot.send_message(admin_id, f"📩 **NEW REQUEST!**\n👤 {sender.first_name} (`{sender.id}`)\n📝 `{query}`")
-                except Exception:
-                    continue
-            await event.reply("✅ **Request Sent to Admins!**")
-    except Exception as e:
-        await status.edit(f"❌ Error searching: {str(e)}")
-
-@bot.on(events.NewMessage(pattern="/indexvault"))
-async def index_vault_handler(event):
-    sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
-        return
-
-    status = await event.reply("🔄 Starting vault indexing...")
-    count = 0
-
-    try:
-        async for msg in bot.iter_messages(DB_CHANNEL_ID, limit=None):
-            if not msg or not msg.media:
-                continue
-
-            file_name = ""
-            if getattr(msg, "file", None) and getattr(msg.file, "name", None):
-                file_name = msg.file.name
-            elif msg.document:
-                for attr in msg.document.attributes:
-                    if isinstance(attr, types.DocumentAttributeFilename):
-                        file_name = attr.file_name
-                        break
-            elif msg.text:
-                file_name = msg.text.split("\n")[0][:80]
-
-            if not file_name:
-                file_name = f"Media_File_{msg.id}"
-
-            if not is_media_filename(file_name):
-                continue
-
-            add_vault_item(msg.id, file_name)
-            count += 1
-
-            if count % 50 == 0:
-                await status.edit(f"🔄 Indexed {count} files...")
-
-        await status.edit(f"✅ Indexing complete. Indexed {count} files.")
-        if not USE_POSTGRES:
-            bot.loop.create_task(backup_database_to_tg())
-    except Exception as e:
-        await status.edit(f"❌ Indexing failed: {e}")
-
-@bot.on(events.NewMessage(pattern="/stats"))
-async def stats_handler(event):
-    if event.sender_id not in AUTH_USERS:
-        return
-    users = get_all_users()
-    await event.reply(f"📊 **Bot Statistics**\n\n👥 Total Users: **{len(users)}**")
-
-@bot.on(events.NewMessage(pattern="/broadcast"))
-async def broadcast_handler(event):
-    if event.sender_id not in AUTH_USERS:
-        return
-    msg = event.text.replace("/broadcast", "").strip()
-    if not msg:
-        return await event.reply("❌ Usage: `/broadcast Hello everyone!`")
-
-    users = get_all_users()
-    sent = 0
-    status = await event.reply(f"🚀 Broadcasting to {len(users)} users...")
-
-    for user in users:
-        try:
-            await bot.send_message(user, msg)
-            sent += 1
-            await asyncio.sleep(0.1)
         except Exception:
             pass
 
-    await status.edit(f"✅ **Broadcast Complete!**\nDelivered to: {sent}/{len(users)}")
+        async for msg in bot.iter_messages(
+            DB_CHANNEL_ID,
+            search="#USER_BACKUP"
+        ):
 
-@bot.on(events.NewMessage(pattern="/tmdb"))
-async def tmdb_handler(event):
-    if event.sender_id not in AUTH_USERS:
-        return
-    query = event.text.replace("/tmdb", "").strip()
-    if not query:
-        return await event.reply("❌ Usage: `/tmdb Inception`")
-    if not TMDB_API_KEY:
-        return await event.reply("❌ TMDB_API_KEY is missing in ENV.")
+            try:
+                await msg.delete()
 
-    status = await event.reply("🔍 Fetching from TMDB...")
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={query}"
-            async with session.get(url) as r:
-                data = await r.json()
+            except Exception:
+                pass
 
-            if not data.get("results"):
-                return await status.edit("❌ Movie not found.")
+        await bot.send_file(
+            DB_CHANNEL_ID,
+            "bot_users.db",
+            caption=(
+                "💾 #USER_BACKUP\n"
+                "DO NOT DELETE."
+            )
+        )
 
-            movie = data["results"][0]
-            title = movie.get("title")
-            year = movie.get("release_date", "").split("-")[0]
-            rating = movie.get("vote_average", "N/A")
-            overview = movie.get("overview", "No summary.")
-            poster_path = movie.get("poster_path")
-            poster_url = f"https://image.tmdb.org/t/p/w500{poster_path}" if poster_path else None
+        print(
+            "✅ SQLite backup uploaded."
+        )
 
-            caption = (
-                f"🎬 **{title} ({year})**\n\n"
-                f"⭐ **IMDb Rating:** {rating}/10\n"
-                f"📖 **Plot:** {overview}\n\n"
-                f"👇 **Download Below**"
+    except Exception as e:
+
+        print(
+            f"❌ Backup upload failed: {e}"
+        )
+
+
+# ============================================================
+# USER DATABASE
+# ============================================================
+def add_user(user_id):
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    INSERT INTO users (
+                        user_id
+                    )
+                    VALUES (%s)
+                    ON CONFLICT (user_id)
+                    DO NOTHING
+                    """,
+                    (user_id,)
+                )
+
+                conn.commit()
+
+        except Exception as e:
+
+            print(
+                f"PostgreSQL user error: {e}"
             )
 
-            if poster_url:
-                await bot.send_file(event.chat_id, poster_url, caption=f"`{caption}`\n\n*(Copy the text above)*")
-                await status.delete()
-            else:
-                await status.edit(f"`{caption}`")
-    except Exception as e:
-        await status.edit(f"❌ Error: {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
-@bot.on(events.NewMessage(pattern="/add"))
-async def add_handler(event):
+        finally:
+
+            release_pg_conn(
+                conn
+            )
+
+        return
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            INSERT OR IGNORE INTO users (
+                user_id
+            )
+            VALUES (?)
+            """,
+            (user_id,)
+        )
+
+        changed = (
+            sqlite_cursor.rowcount > 0
+        )
+
+        sqlite_conn.commit()
+
+        if changed:
+
+            try:
+
+                asyncio.create_task(
+                    backup_database_to_tg()
+                )
+
+            except Exception:
+                pass
+
+    except Exception as e:
+
+        print(
+            f"SQLite user error: {e}"
+        )
+
+
+def get_all_users():
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT user_id
+                    FROM users
+                    ORDER BY user_id
+                    """
+                )
+
+                return [
+                    row[0]
+                    for row in cursor.fetchall()
+                ]
+
+        except Exception as e:
+
+            print(
+                f"PostgreSQL fetch error: {e}"
+            )
+
+            return []
+
+        finally:
+
+            release_pg_conn(
+                conn
+            )
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            SELECT user_id
+            FROM users
+            """
+        )
+
+        return [
+            row[0]
+            for row in sqlite_cursor.fetchall()
+        ]
+
+    except Exception as e:
+
+        print(
+            f"SQLite fetch error: {e}"
+        )
+
+        return []
+
+
+def get_user_count():
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    "SELECT COUNT(*) FROM users"
+                )
+
+                return cursor.fetchone()[0]
+
+        except Exception:
+            return 0
+
+        finally:
+            release_pg_conn(conn)
+
+    try:
+
+        sqlite_cursor.execute(
+            "SELECT COUNT(*) FROM users"
+        )
+
+        return sqlite_cursor.fetchone()[0]
+
+    except Exception:
+        return 0
+
+
+# ============================================================
+# VAULT INDEX
+# ============================================================
+def add_vault_item(
+    msg_id,
+    file_name
+):
+
+    if not is_video_filename(
+        file_name
+    ):
+
+        print(
+            f"⚠️ Rejected non-video: {file_name}"
+        )
+
+        return False
+
+    title, media_type, season, episode = (
+        parse_media_meta(
+            file_name
+        )
+    )
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    INSERT INTO vault (
+                        msg_id,
+                        file_name,
+                        title,
+                        media_type,
+                        season,
+                        episode
+                    )
+                    VALUES (
+                        %s, %s, %s,
+                        %s, %s, %s
+                    )
+
+                    ON CONFLICT (msg_id)
+                    DO UPDATE SET
+                        file_name =
+                            EXCLUDED.file_name,
+                        title =
+                            EXCLUDED.title,
+                        media_type =
+                            EXCLUDED.media_type,
+                        season =
+                            EXCLUDED.season,
+                        episode =
+                            EXCLUDED.episode
+                    """,
+                    (
+                        msg_id,
+                        file_name,
+                        title,
+                        media_type,
+                        season,
+                        episode
+                    )
+                )
+
+                conn.commit()
+
+            return True
+
+        except Exception as e:
+
+            print(
+                f"PostgreSQL vault error: {e}"
+            )
+
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+            return False
+
+        finally:
+
+            release_pg_conn(
+                conn
+            )
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            INSERT OR REPLACE INTO vault (
+                msg_id,
+                file_name,
+                title,
+                media_type,
+                season,
+                episode
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                msg_id,
+                file_name,
+                title,
+                media_type,
+                season,
+                episode
+            )
+        )
+
+        sqlite_conn.commit()
+
+        return True
+
+    except Exception as e:
+
+        print(
+            f"SQLite vault error: {e}"
+        )
+
+        return False
+
+
+def search_vault(query):
+
+    words = query.strip().split()
+
+    if not words:
+        return []
+
+    # Don't allow non-video results.
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conditions = " AND ".join(
+                [
+                    """
+                    (
+                        title ILIKE %s
+                        OR file_name ILIKE %s
+                    )
+                    """
+                    for _ in words
+                ]
+            )
+
+            params = []
+
+            for word in words:
+
+                params.extend(
+                    [
+                        f"%{word}%",
+                        f"%{word}%"
+                    ]
+                )
+
+            sql = f"""
+                SELECT msg_id
+                FROM vault
+                WHERE media_type IN (
+                    'movie',
+                    'series'
+                )
+                AND {conditions}
+                ORDER BY
+                    media_type DESC,
+                    title ASC,
+                    season ASC,
+                    episode ASC NULLS LAST
+                LIMIT 8
+            """
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    sql,
+                    tuple(params)
+                )
+
+                return [
+                    row[0]
+                    for row in cursor.fetchall()
+                ]
+
+        except Exception as e:
+
+            print(
+                f"PostgreSQL search error: {e}"
+            )
+
+            return []
+
+        finally:
+
+            release_pg_conn(
+                conn
+            )
+
+    try:
+
+        conditions = " AND ".join(
+            [
+                """
+                (
+                    title LIKE ?
+                    OR file_name LIKE ?
+                )
+                """
+                for _ in words
+            ]
+        )
+
+        params = []
+
+        for word in words:
+
+            params.extend(
+                [
+                    f"%{word}%",
+                    f"%{word}%"
+                ]
+            )
+
+        sql = f"""
+            SELECT msg_id
+            FROM vault
+            WHERE media_type IN (
+                'movie',
+                'series'
+            )
+            AND {conditions}
+            ORDER BY
+                media_type DESC,
+                title ASC,
+                season ASC,
+                episode ASC
+            LIMIT 8
+        """
+
+        sqlite_cursor.execute(
+            sql,
+            tuple(params)
+        )
+
+        return [
+            row[0]
+            for row in sqlite_cursor.fetchall()
+        ]
+
+    except Exception as e:
+
+        print(
+            f"SQLite search error: {e}"
+        )
+
+        return []
+
+
+def get_vault_record(msg_id):
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT
+                        msg_id,
+                        file_name,
+                        title,
+                        media_type,
+                        season,
+                        episode
+                    FROM vault
+                    WHERE msg_id = %s
+                    """,
+                    (msg_id,)
+                )
+
+                row = cursor.fetchone()
+
+                return row
+
+        except Exception:
+            return None
+
+        finally:
+            release_pg_conn(conn)
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            SELECT
+                msg_id,
+                file_name,
+                title,
+                media_type,
+                season,
+                episode
+            FROM vault
+            WHERE msg_id = ?
+            """,
+            (msg_id,)
+        )
+
+        return sqlite_cursor.fetchone()
+
+    except Exception:
+        return None
+
+
+def get_vault_count():
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM vault
+                    WHERE media_type IN (
+                        'movie',
+                        'series'
+                    )
+                    """
+                )
+
+                return cursor.fetchone()[0]
+
+        except Exception:
+            return 0
+
+        finally:
+            release_pg_conn(conn)
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM vault
+            WHERE media_type IN (
+                'movie',
+                'series'
+            )
+            """
+        )
+
+        return sqlite_cursor.fetchone()[0]
+
+    except Exception:
+        return 0
+
+
+# ============================================================
+# FILE HELPERS
+# ============================================================
+def get_message_filename(msg):
+
+    try:
+
+        if getattr(
+            msg,
+            "file",
+            None
+        ):
+
+            name = getattr(
+                msg.file,
+                "name",
+                None
+            )
+
+            if name:
+                return str(name)
+
+    except Exception:
+        pass
+
+    try:
+
+        document = getattr(
+            msg,
+            "document",
+            None
+        )
+
+        if document:
+
+            for attr in document.attributes:
+
+                if isinstance(
+                    attr,
+                    types.DocumentAttributeFilename
+                ):
+
+                    return attr.file_name
+
+    except Exception:
+        pass
+
+    return ""
+
+
+def get_message_filename_or_fallback(msg):
+
+    name = get_message_filename(
+        msg
+    )
+
+    if name:
+
+        return sanitize_filename(
+            name
+        )
+
+    # Native Telegram video may not have
+    # a filename. Give it a safe MP4 name.
+    if getattr(
+        msg,
+        "video",
+        None
+    ):
+
+        return (
+            f"Video_{msg.id}.mp4"
+        )
+
+    return ""
+
+
+# ============================================================
+# VAULT MESSAGE
+# ============================================================
+async def get_vault_message(
+    vault_id
+):
+
+    try:
+
+        msg = await bot.get_messages(
+            DB_CHANNEL_ID,
+            ids=vault_id
+        )
+
+        if (
+            msg
+            and msg.media
+            and is_video_message(msg)
+        ):
+
+            return msg
+
+    except Exception as e:
+
+        print(
+            f"Vault lookup failed "
+            f"for {vault_id}: {e}"
+        )
+
+    return None
+
+
+# ============================================================
+# PUBLIC -> PRIVATE MAPPING
+# ============================================================
+def save_public_mapping(
+    public_msg_id,
+    vault_msg_id
+):
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    INSERT INTO vault_map (
+                        public_msg_id,
+                        vault_msg_id
+                    )
+                    VALUES (%s, %s)
+
+                    ON CONFLICT (
+                        public_msg_id
+                    )
+                    DO UPDATE SET
+                        vault_msg_id =
+                        EXCLUDED.vault_msg_id
+                    """,
+                    (
+                        public_msg_id,
+                        vault_msg_id
+                    )
+                )
+
+                conn.commit()
+
+        except Exception as e:
+
+            print(
+                f"Mapping error: {e}"
+            )
+
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        finally:
+
+            release_pg_conn(conn)
+
+        return
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            INSERT OR REPLACE INTO
+            vault_map (
+                public_msg_id,
+                vault_msg_id
+            )
+            VALUES (?, ?)
+            """,
+            (
+                public_msg_id,
+                vault_msg_id
+            )
+        )
+
+        sqlite_conn.commit()
+
+    except Exception as e:
+
+        print(
+            f"Mapping error: {e}"
+        )
+
+
+def get_vault_id_from_public(
+    public_msg_id
+):
+
+    if USE_POSTGRES:
+
+        conn = None
+
+        try:
+
+            conn = get_pg_conn()
+
+            with conn.cursor() as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT vault_msg_id
+                    FROM vault_map
+                    WHERE public_msg_id = %s
+                    """,
+                    (public_msg_id,)
+                )
+
+                row = cursor.fetchone()
+
+                return (
+                    row[0]
+                    if row
+                    else None
+                )
+
+        except Exception:
+            return None
+
+        finally:
+            release_pg_conn(conn)
+
+    try:
+
+        sqlite_cursor.execute(
+            """
+            SELECT vault_msg_id
+            FROM vault_map
+            WHERE public_msg_id = ?
+            """,
+            (public_msg_id,)
+        )
+
+        row = sqlite_cursor.fetchone()
+
+        return (
+            row[0]
+            if row
+            else None
+        )
+
+    except Exception:
+        return None
+
+
+def is_public_message_migrated(
+    public_msg_id
+):
+
+    return (
+        get_vault_id_from_public(
+            public_msg_id
+        )
+        is not None
+    )
+
+
+# ============================================================
+# PUBLIC CARD
+# ============================================================
+async def send_public_card(
+    caption,
+    buttons,
+    poster_path=None
+):
+
+    if poster_path:
+
+        try:
+
+            public_msg = await bot.send_file(
+                DB_CHANNEL_ID,
+                poster_path,
+                caption=caption,
+                buttons=buttons
+            )
+
+        finally:
+
+            try:
+
+                if os.path.exists(
+                    poster_path
+                ):
+
+                    os.remove(
+                        poster_path
+                    )
+
+            except Exception:
+                pass
+
+    else:
+
+        public_msg = await bot.send_message(
+            DB_CHANNEL_ID,
+            caption,
+            buttons=buttons
+        )
+
+    return public_msg
+
+
+# ============================================================
+# DOOD LINK
+# ============================================================
+def fix_dood_link(link):
+
+    if not link:
+        return None
+
+    bad_domains = [
+        "dsvplay.com",
+        "dood.re",
+        "dood.wf",
+        "dood.cx",
+        "dood.sh",
+        "dood.pm",
+        "dood.to",
+        "dood.so",
+        "dood.la"
+    ]
+
+    clean_link = link
+
+    for domain in bad_domains:
+
+        if domain in clean_link:
+
+            clean_link = clean_link.replace(
+                domain,
+                "myvidplay.com"
+            )
+
+            break
+
+    if (
+        "myvidplay.com"
+        not in clean_link
+        and "http" in clean_link
+    ):
+
+        clean_link = re.sub(
+            r"https?://[^/]+",
+            "https://myvidplay.com",
+            clean_link
+        )
+
+    return clean_link
+
+
+# ============================================================
+# AUTO DELETE
+# ============================================================
+async def auto_delete_task(
+    event,
+    messages,
+    delay=AUTO_DELETE_SECONDS
+):
+
+    await asyncio.sleep(
+        delay
+    )
+
+    try:
+
+        for msg in messages:
+
+            try:
+                await msg.delete()
+
+            except Exception:
+                pass
+
+        try:
+
+            await event.respond(
+                "⏱️ *Files auto-deleted for "
+                "security. Request them again "
+                "if needed!*"
+            )
+
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# FORCE SUB
+# ============================================================
+async def check_subscription(
+    user_id
+):
+
+    if not FORCE_SUB_CHANNEL:
+        return True
+
+    if user_id in AUTH_USERS:
+        return True
+
+    try:
+
+        await bot(
+            functions.channels.GetParticipantRequest(
+                channel=FORCE_SUB_CHANNEL,
+                participant=user_id
+            )
+        )
+
+        return True
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# PROGRESS BAR
+# ============================================================
+async def progress_bar(
+    current,
+    total,
+    status_msg,
+    action_name,
+    last_time_ref
+):
+
+    now = time.time()
+
+    if (
+        now - last_time_ref[0]
+        < 5
+    ):
+
+        return
+
+    if total:
+
+        percentage = (
+            current
+            * 100
+            / total
+        )
+
+    else:
+
+        percentage = 0
+
+    filled = int(
+        percentage / 10
+    )
+
+    filled = min(
+        max(
+            filled,
+            0
+        ),
+        10
+    )
+
+    bar = (
+        "▓" * filled
+        +
+        "░" * (
+            10 - filled
+        )
+    )
+
+    try:
+
+        await status_msg.edit(
+            f"{action_name}\n"
+            f"{bar} "
+            f"**{percentage:.1f}%**\n"
+            f"`{human_size(current)}`"
+            + (
+                f" / `{human_size(total)}`"
+                if total
+                else ""
+            )
+        )
+
+        last_time_ref[0] = now
+
+    except Exception:
+        pass
+
+
+# ============================================================
+# SMART DOWNLOAD
+# ============================================================
+async def smart_download(
+    client,
+    message,
+    filename,
+    progress_callback
+):
+
+    if not is_video_message(
+        message
+    ):
+
+        return False
+
+    filename = sanitize_filename(
+        filename
+    )
+
+    if not is_video_filename(
+        filename
+    ):
+
+        return False
+
+    try:
+
+        await client.download_media(
+            message,
+            file=filename,
+            progress_callback=progress_callback
+        )
+
+        if os.path.exists(
+            filename
+        ):
+
+            return True
+
+    except Exception as e:
+
+        print(
+            f"Primary Telegram download "
+            f"failed: {e}"
+        )
+
+    try:
+
+        if (
+            hasattr(
+                message,
+                "media"
+            )
+            and hasattr(
+                message.media,
+                "document"
+            )
+        ):
+
+            await client.download_media(
+                message.media.document,
+                file=filename,
+                progress_callback=progress_callback
+            )
+
+            if os.path.exists(
+                filename
+            ):
+
+                return True
+
+    except Exception as e:
+
+        print(
+            f"Fallback Telegram download "
+            f"failed: {e}"
+        )
+
+    return False
+
+
+# ============================================================
+# MIGRATION
+# ============================================================
+async def migrate_message(
+    public_msg,
+    status_msg=None
+):
+
+    if not public_msg:
+        return False, None
+
+    # STRICT VIDEO CHECK
+    if not is_video_message(
+        public_msg
+    ):
+
+        return False, None
+
+    public_id = public_msg.id
+
+    existing_id = (
+        get_vault_id_from_public(
+            public_id
+        )
+    )
+
+    if existing_id:
+
+        return (
+            False,
+            existing_id
+        )
+
+    file_name = (
+        get_message_filename_or_fallback(
+            public_msg
+        )
+    )
+
+    if not is_video_filename(
+        file_name
+    ):
+
+        return False, None
+
+    try:
+
+        forwarded = await bot.forward_messages(
+            DB_CHANNEL_ID,
+            public_id,
+            from_peer=PUBLIC_DB_CHANNEL_ID
+        )
+
+        if isinstance(
+            forwarded,
+            list
+        ):
+
+            if not forwarded:
+                return False, None
+
+            vault_msg = forwarded[0]
+
+        else:
+
+            vault_msg = forwarded
+
+        if not vault_msg:
+            return False, None
+
+        # Confirm the forwarded item is a video.
+        if not is_video_message(
+            vault_msg
+        ):
+
+            try:
+                await vault_msg.delete()
+            except Exception:
+                pass
+
+            return False, None
+
+        if not add_vault_item(
+            vault_msg.id,
+            file_name
+        ):
+
+            return False, None
+
+        save_public_mapping(
+            public_id,
+            vault_msg.id
+        )
+
+        return (
+            True,
+            vault_msg.id
+        )
+
+    except Exception as e:
+
+        print(
+            f"Migration failed for "
+            f"{public_id}: {e}"
+        )
+
+        return (
+            False,
+            None
+        )
+
+
+def parse_migration_date(
+    value
+):
+
+    try:
+
+        return datetime.strptime(
+            value,
+            "%Y-%m-%d"
+        ).replace(
+            tzinfo=timezone.utc
+        )
+
+    except Exception:
+
+        return None
+
+
+async def migrate_by_range(
+    start_id,
+    end_id,
+    status_msg
+):
+
+    if MIGRATION_LOCK.locked():
+
+        await status_msg.edit(
+            "⚠️ A migration is already running."
+        )
+
+        return
+
+    async with MIGRATION_LOCK:
+
+        migrated = 0
+        skipped = 0
+        failed = 0
+        checked = 0
+
+        try:
+
+            if start_id < end_id:
+
+                step_range = range(
+                    start_id,
+                    end_id + 1
+                )
+
+            else:
+
+                step_range = range(
+                    start_id,
+                    end_id - 1,
+                    -1
+                )
+
+            total = len(
+                step_range
+            )
+
+            for msg_id in step_range:
+
+                checked += 1
+
+                if is_public_message_migrated(
+                    msg_id
+                ):
+
+                    skipped += 1
+                    continue
+
+                try:
+
+                    public_msg = await bot.get_messages(
+                        PUBLIC_DB_CHANNEL_ID,
+                        ids=msg_id
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"Could not read public "
+                        f"ID {msg_id}: {e}"
+                    )
+
+                    failed += 1
+                    continue
+
+                if (
+                    not public_msg
+                    or not public_msg.media
+                ):
+
+                    skipped += 1
+                    continue
+
+                # Only migrate videos.
+                if not is_video_message(
+                    public_msg
+                ):
+
+                    skipped += 1
+                    continue
+
+                ok, private_id = (
+                    await migrate_message(
+                        public_msg,
+                        status_msg
+                    )
+                )
+
+                if ok:
+
+                    migrated += 1
+
+                elif private_id:
+
+                    skipped += 1
+
+                else:
+
+                    failed += 1
+
+                if (
+                    checked % 10 == 0
+                    or checked == total
+                ):
+
+                    await status_msg.edit(
+                        "🔄 **Migration Running**\n\n"
+                        f"📊 Checked: "
+                        f"`{checked}/{total}`\n"
+                        f"🎬 Videos: "
+                        f"`{migrated}`\n"
+                        f"⏭️ Skipped: "
+                        f"`{skipped}`\n"
+                        f"❌ Failed: "
+                        f"`{failed}`"
+                    )
+
+                await asyncio.sleep(
+                    0.15
+                )
+
+            await status_msg.edit(
+                "✅ **Migration Complete**\n\n"
+                f"📊 Checked: `{checked}`\n"
+                f"🎬 Videos migrated: "
+                f"`{migrated}`\n"
+                f"⏭️ Skipped: `{skipped}`\n"
+                f"❌ Failed: `{failed}`"
+            )
+
+        except Exception as e:
+
+            await status_msg.edit(
+                f"❌ Migration stopped:\n`{e}`"
+            )
+
+
+async def migrate_by_date(
+    start_date,
+    end_date,
+    status_msg
+):
+
+    if MIGRATION_LOCK.locked():
+
+        await status_msg.edit(
+            "⚠️ A migration is already running."
+        )
+
+        return
+
+    async with MIGRATION_LOCK:
+
+        migrated = 0
+        skipped = 0
+        failed = 0
+        checked = 0
+
+        try:
+
+            if end_date is None:
+
+                end_date = now_utc()
+
+            async for public_msg in bot.iter_messages(
+                PUBLIC_DB_CHANNEL_ID,
+                offset_date=end_date,
+                reverse=False
+            ):
+
+                if not public_msg.date:
+                    continue
+
+                message_date = (
+                    public_msg.date
+                )
+
+                if message_date.tzinfo is None:
+
+                    message_date = (
+                        message_date.replace(
+                            tzinfo=timezone.utc
+                        )
+                    )
+
+                if (
+                    message_date
+                    < start_date
+                ):
+
+                    break
+
+                checked += 1
+
+                if not public_msg.media:
+
+                    skipped += 1
+                    continue
+
+                # STRICT VIDEO ONLY
+                if not is_video_message(
+                    public_msg
+                ):
+
+                    skipped += 1
+                    continue
+
+                if is_public_message_migrated(
+                    public_msg.id
+                ):
+
+                    skipped += 1
+                    continue
+
+                ok, private_id = (
+                    await migrate_message(
+                        public_msg,
+                        status_msg
+                    )
+                )
+
+                if ok:
+
+                    migrated += 1
+
+                elif private_id:
+
+                    skipped += 1
+
+                else:
+
+                    failed += 1
+
+                if checked % 10 == 0:
+
+                    await status_msg.edit(
+                        "🔄 **Date Migration Running**\n\n"
+                        f"📊 Checked: `{checked}`\n"
+                        f"🎬 Videos: `{migrated}`\n"
+                        f"⏭️ Skipped: `{skipped}`\n"
+                        f"❌ Failed: `{failed}`"
+                    )
+
+                await asyncio.sleep(
+                    0.15
+                )
+
+            await status_msg.edit(
+                "✅ **Date Migration Complete**\n\n"
+                f"📊 Checked: `{checked}`\n"
+                f"🎬 Videos migrated: "
+                f"`{migrated}`\n"
+                f"⏭️ Skipped: `{skipped}`\n"
+                f"❌ Failed: `{failed}`"
+            )
+
+        except Exception as e:
+
+            await status_msg.edit(
+                f"❌ Date migration failed:\n`{e}`"
+            )
+
+
+# ============================================================
+# MIGRATION COMMAND
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/migrate(?:\s|$)"
+    )
+)
+async def migrate_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    if not PUBLIC_DB_CHANNEL_ID:
+
+        return await event.reply(
+            "❌ `PUBLIC_DB_CHANNEL_ID` "
+            "is not configured."
+        )
+
+    args = event.text.split()
+
+    if len(args) < 2:
+
+        return await event.reply(
+            "📦 **Migration Usage**\n\n"
+            "`/migrate 100-500`\n"
+            "Migrate IDs 100 → 500.\n\n"
+            "`/migrate 19417`\n"
+            "Start at 19417 and migrate downward.\n\n"
+            "`/migrate date 2026-01-01`\n"
+            "Migrate from that date until now.\n\n"
+            "`/migrate date 2026-01-01 2026-08-10`\n"
+            "Migrate between two dates.\n\n"
+            "🎬 Only video files are migrated."
+        )
+
+    # --------------------------------------------------------
+    # DATE MIGRATION
+    # --------------------------------------------------------
+    if args[1].lower() == "date":
+
+        if len(args) < 3:
+
+            return await event.reply(
+                "❌ Example:\n"
+                "`/migrate date 2026-01-01`"
+            )
+
+        start_date = parse_migration_date(
+            args[2]
+        )
+
+        if not start_date:
+
+            return await event.reply(
+                "❌ Invalid start date.\n"
+                "Use `YYYY-MM-DD`."
+            )
+
+        end_date = None
+
+        if len(args) >= 4:
+
+            end_date = parse_migration_date(
+                args[3]
+            )
+
+            if not end_date:
+
+                return await event.reply(
+                    "❌ Invalid end date.\n"
+                    "Use `YYYY-MM-DD`."
+                )
+
+            end_date = end_date.replace(
+                hour=23,
+                minute=59,
+                second=59
+            )
+
+        status = await event.reply(
+            "🚀 **Starting video migration...**"
+        )
+
+        asyncio.create_task(
+            migrate_by_date(
+                start_date,
+                end_date,
+                status
+            )
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RANGE MIGRATION
+    # --------------------------------------------------------
+    value = args[1]
+
+    if "-" in value:
+
+        try:
+
+            first, second = value.split(
+                "-",
+                1
+            )
+
+            start_id = int(first)
+            end_id = int(second)
+
+        except Exception:
+
+            return await event.reply(
+                "❌ Invalid range.\n"
+                "Example: `/migrate 100-500`"
+            )
+
+    else:
+
+        try:
+
+            start_id = int(value)
+
+        except ValueError:
+
+            return await event.reply(
+                "❌ Invalid ID."
+            )
+
+        status = await event.reply(
+            "🔍 Finding oldest message "
+            "in public DB..."
+        )
+
+        try:
+
+            oldest = await bot.get_messages(
+                PUBLIC_DB_CHANNEL_ID,
+                limit=1,
+                reverse=True
+            )
+
+            if isinstance(
+                oldest,
+                list
+            ):
+
+                if not oldest:
+
+                    return await status.edit(
+                        "❌ Public DB is empty."
+                    )
+
+                oldest_id = oldest[0].id
+
+            else:
+
+                if not oldest:
+
+                    return await status.edit(
+                        "❌ Public DB is empty."
+                    )
+
+                oldest_id = oldest.id
+
+            end_id = oldest_id
+
+        except Exception as e:
+
+            return await status.edit(
+                "❌ Could not inspect "
+                f"public DB:\n`{e}`"
+            )
+
+        await status.edit(
+            f"🚀 **Starting downward migration**\n\n"
+            f"From: `{start_id}`\n"
+            f"To: `{end_id}`\n\n"
+            "🎬 Video files only."
+        )
+
+        asyncio.create_task(
+            migrate_by_range(
+                start_id,
+                end_id,
+                status
+            )
+        )
+
+        return
+
+    status = await event.reply(
+        f"🚀 **Starting migration**\n\n"
+        f"From: `{start_id}`\n"
+        f"To: `{end_id}`"
+    )
+
+    asyncio.create_task(
+        migrate_by_range(
+            start_id,
+            end_id,
+            status
+        )
+    )
+
+
+# ============================================================
+# CHECK PUBLIC DB
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/checkpublicdb$"
+    )
+)
+async def check_public_db_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    if not PUBLIC_DB_CHANNEL_ID:
+
+        return await event.reply(
+            "❌ `PUBLIC_DB_CHANNEL_ID` is missing."
+        )
+
+    try:
+
+        channel = await bot.get_entity(
+            PUBLIC_DB_CHANNEL_ID
+        )
+
+        await event.reply(
+            "✅ **Public Migration Source Verified**\n\n"
+            f"🏷️ **Name:** "
+            f"{getattr(channel, 'title', 'Unknown')}\n"
+            f"🆔 **ID:** `{PUBLIC_DB_CHANNEL_ID}`\n\n"
+            "🎬 Migration accepts videos only."
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            "❌ Could not access public DB.\n\n"
+            f"`{e}`"
+        )
+
+
+# ============================================================
+# CHECK PRIVATE DB
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/checkchannel$"
+    )
+)
+async def check_channel_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    try:
+
+        channel = await bot.get_entity(
+            DB_CHANNEL_ID
+        )
+
+        await event.reply(
+            "✅ **Private Vault Verified**\n\n"
+            f"🏷️ **Name:** "
+            f"{getattr(channel, 'title', 'Unknown')}\n"
+            f"🆔 **ID:** `{DB_CHANNEL_ID}`"
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            "❌ Could not access private vault.\n\n"
+            f"`{e}`"
+        )
+
+
+# ============================================================
+# CHECK DATABASE
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/checkdb$"
+    )
+)
+async def check_db_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    try:
+
+        count = get_vault_count()
+
+        if USE_POSTGRES:
+
+            await event.reply(
+                f"🐘 **PostgreSQL**\n\n"
+                f"🎬 Video files: `{count}`"
+            )
+
+        else:
+
+            await event.reply(
+                f"💾 **SQLite**\n\n"
+                f"🎬 Video files: `{count}`"
+            )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Database error:\n`{e}`"
+        )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/health$"
+    )
+)
+async def health_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    try:
+
+        me = await bot.get_me()
+
+        vault_count = (
+            get_vault_count()
+        )
+
+        user_count = (
+            get_user_count()
+        )
+
+        await event.reply(
+            "🟢 **MAXCINEMA HEALTH**\n\n"
+            f"🤖 Bot: `@{me.username}`\n"
+            f"💾 Database: "
+            f"`{'PostgreSQL' if USE_POSTGRES else 'SQLite'}`\n"
+            f"🎬 Videos: `{vault_count}`\n"
+            f"👥 Users: `{user_count}`\n"
+            f"📥 Queue: `{WORK_QUEUE.qsize()}`\n"
+            f"🔄 Migration: "
+            f"`{'RUNNING' if MIGRATION_LOCK.locked() else 'IDLE'}`\n"
+            f"🌐 Stream limit: `{STREAM_CONCURRENCY}`"
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            f"🔴 **Health Check Failed**\n\n"
+            f"`{e}`"
+        )
+
+
+# ============================================================
+# VIDEO STATS
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/videostats$"
+    )
+)
+async def video_stats_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    try:
+
+        if USE_POSTGRES:
+
+            conn = None
+
+            try:
+
+                conn = get_pg_conn()
+
+                with conn.cursor() as cursor:
+
+                    cursor.execute(
+                        """
+                        SELECT
+                            media_type,
+                            COUNT(*)
+                        FROM vault
+                        GROUP BY media_type
+                        ORDER BY media_type
+                        """
+                    )
+
+                    rows = cursor.fetchall()
+
+            finally:
+
+                release_pg_conn(
+                    conn
+                )
+
+        else:
+
+            sqlite_cursor.execute(
+                """
+                SELECT
+                    media_type,
+                    COUNT(*)
+                FROM vault
+                GROUP BY media_type
+                ORDER BY media_type
+                """
+            )
+
+            rows = sqlite_cursor.fetchall()
+
+        lines = [
+            "📊 **VIDEO VAULT STATS**",
+            ""
+        ]
+
+        total = 0
+
+        for row in rows:
+
+            media_type = row[0]
+            count = row[1]
+
+            total += count
+
+            lines.append(
+                f"🎬 {media_type}: `{count}`"
+            )
+
+        lines.extend(
+            [
+                "",
+                f"📦 Total: `{total}`"
+            ]
+        )
+
+        await event.reply(
+            "\n".join(lines)
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Stats error:\n`{e}`"
+        )
+
+
+# ============================================================
+# VAULT LOOKUP
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/vault\s+\d+$"
+    )
+)
+async def vault_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    try:
+
+        msg_id = int(
+            event.text.split()[1]
+        )
+
+        record = get_vault_record(
+            msg_id
+        )
+
+        if not record:
+
+            return await event.reply(
+                "❌ Vault record not found."
+            )
+
+        await event.reply(
+            "🎬 **VAULT ITEM**\n\n"
+            f"🆔 ID: `{record[0]}`\n"
+            f"📁 File: `{record[1]}`\n"
+            f"🎞️ Title: `{record[2]}`\n"
+            f"📌 Type: `{record[3]}`\n"
+            f"📺 Season: `{record[4] or '-'}`\n"
+            f"🎬 Episode: `{record[5] or '-'}`"
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Vault lookup failed:\n`{e}`"
+        )
+
+
+# ============================================================
+# ADMIN SEARCH
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/find(?:\s|$)"
+    )
+)
+async def find_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    query = (
+        event.text
+        .replace(
+            "/find",
+            "",
+            1
+        )
+        .strip()
+    )
+
+    if not query:
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/find Stranger Things`"
+        )
+
+    ids = search_vault(
+        query
+    )
+
+    if not ids:
+
+        return await event.reply(
+            "❌ No videos found."
+        )
+
+    lines = [
+        "🔎 **VIDEO SEARCH RESULTS**",
+        ""
+    ]
+
+    for msg_id in ids:
+
+        record = get_vault_record(
+            msg_id
+        )
+
+        if record:
+
+            lines.append(
+                f"🎬 `{record[0]}` — "
+                f"{record[1]}"
+            )
+
+    await event.reply(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/start"
+    )
+)
+async def start_handler(event):
+
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
+
+    if not sender:
+        return
+
+    add_user(
+        sender.id
+    )
+
+    args = event.text.split()
+
+    is_joined = await check_subscription(
+        sender.id
+    )
+
+    # ========================================================
+    # DEEP LINK
+    # ========================================================
+    if len(args) > 1:
+
+        param = args[1]
+
+        if not is_joined:
+
+            me = await bot.get_me()
+
+            msg = (
+                "⛔ **Access Denied!**\n\n"
+                "You must join our main channel "
+                "to download this file."
+            )
+
+            btn = [
+                [
+                    Button.url(
+                        "📢 Join Channel",
+                        url=(
+                            CHANNEL_LINK
+                            or
+                            "https://t.me/MaxCinemaOfficial"
+                        )
+                    )
+                ],
+                [
+                    Button.url(
+                        "🔄 Try Again",
+                        url=(
+                            f"https://t.me/"
+                            f"{me.username}"
+                            f"?start={param}"
+                        )
+                    )
+                ]
+            ]
+
+            return await event.reply(
+                msg,
+                buttons=btn
+            )
+
+        status = await event.reply(
+            "📂 **Fetching your video...**"
+        )
+
+        # ====================================================
+        # PACK
+        # ====================================================
+        if param.startswith(
+            "pack_"
+        ):
+
+            try:
+
+                _, start_id, end_id = (
+                    param.split("_")
+                )
+
+                ids_to_fetch = range(
+                    int(start_id),
+                    int(end_id) + 1
+                )
+
+                found_any = False
+
+                sent_messages = []
+
+                for msg_id in ids_to_fetch:
+
+                    msg = await get_vault_message(
+                        msg_id
+                    )
+
+                    if not msg:
+                        continue
+
+                    sent_file = (
+                        await bot.send_file(
+                            event.chat_id,
+                            msg.media,
+                            caption=msg.text
+                        )
+                    )
+
+                    sent_messages.append(
+                        sent_file
+                    )
+
+                    found_any = True
+
+                if found_any:
+
+                    warning = await event.reply(
+                        "⏳ **SECURITY:** "
+                        f"*Videos will auto-delete "
+                        f"in {AUTO_DELETE_SECONDS // 60} "
+                        "minutes.*"
+                    )
+
+                    sent_messages.append(
+                        warning
+                    )
+
+                    asyncio.create_task(
+                        auto_delete_task(
+                            event,
+                            sent_messages
+                        )
+                    )
+
+                    await status.delete()
+
+                else:
+
+                    await status.edit(
+                        "❌ Video pack not found."
+                    )
+
+            except Exception as e:
+
+                await status.edit(
+                    f"❌ Pack error:\n`{e}`"
+                )
+
+        # ====================================================
+        # SINGLE VIDEO
+        # ====================================================
+        else:
+
+            try:
+
+                msg_id = int(
+                    param
+                )
+
+                msg = await get_vault_message(
+                    msg_id
+                )
+
+                # Try public -> private mapping.
+                if not msg:
+
+                    mapped_id = (
+                        get_vault_id_from_public(
+                            msg_id
+                        )
+                    )
+
+                    if mapped_id:
+
+                        msg = (
+                            await get_vault_message(
+                                mapped_id
+                            )
+                        )
+
+                if (
+                    msg
+                    and msg.media
+                    and is_video_message(msg)
+                ):
+
+                    sent_file = (
+                        await bot.send_file(
+                            event.chat_id,
+                            msg.media,
+                            caption=msg.text
+                        )
+                    )
+
+                    warning = await event.reply(
+                        "⏳ **SECURITY:** "
+                        f"*This video will auto-delete "
+                        f"in {AUTO_DELETE_SECONDS // 60} "
+                        "minutes.*"
+                    )
+
+                    asyncio.create_task(
+                        auto_delete_task(
+                            event,
+                            [
+                                sent_file,
+                                warning
+                            ]
+                        )
+                    )
+
+                    await status.delete()
+
+                else:
+
+                    await status.edit(
+                        "❌ Video not found."
+                    )
+
+            except Exception as e:
+
+                await status.edit(
+                    f"❌ Error processing video:\n"
+                    f"`{e}`"
+                )
+
+        return
+
+    # ========================================================
+    # ADMIN START
+    # ========================================================
+    if sender.id in AUTH_USERS:
+
+        admin_guide = (
+            "**👑 MAXCINEMA ADMIN GUIDE**\n\n"
+
+            "**1️⃣ MIRROR**\n"
+            "`/mirror name.mp4`\n\n"
+
+            "**2️⃣ ADD VIDEO**\n"
+            "Reply `/add` to a video.\n\n"
+
+            "**3️⃣ POST**\n"
+            "Reply photo + `/post`.\n\n"
+
+            "**4️⃣ POST ID**\n"
+            "`/postid 1234 Caption`\n\n"
+
+            "**5️⃣ POST PACK**\n"
+            "`/postpack 100-107 Caption`\n\n"
+
+            "**6️⃣ TMDB**\n"
+            "`/tmdb Inception`\n\n"
+
+            "**7️⃣ BROADCAST**\n"
+            "`/broadcast Message`\n\n"
+
+            "**8️⃣ STATS**\n"
+            "`/stats`\n\n"
+
+            "**9️⃣ VIDEO STATS**\n"
+            "`/videostats`\n\n"
+
+            "**🔟 INDEX VAULT**\n"
+            "`/indexvault`\n\n"
+
+            "**1️⃣1️⃣ FIND VIDEO**\n"
+            "`/find Movie Name`\n\n"
+
+            "**1️⃣2️⃣ VAULT ITEM**\n"
+            "`/vault 1234`\n\n"
+
+            "**1️⃣3️⃣ MIGRATION**\n"
+            "`/migrate 100-500`\n"
+            "`/migrate 19417`\n"
+            "`/migrate date 2026-01-01`\n\n"
+
+            "**1️⃣4️⃣ CHECK PUBLIC DB**\n"
+            "`/checkpublicdb`\n\n"
+
+            "**1️⃣5️⃣ CHECK PRIVATE DB**\n"
+            "`/checkchannel`\n\n"
+
+            "**1️⃣6️⃣ HEALTH**\n"
+            "`/health`\n\n"
+
+            "🎬 **VIDEO ONLY:**\n"
+            "MP4 • MKV • AVI • MOV • WEBM • "
+            "M4V • TS • MPEG • MPG • 3GP • "
+            "FLV • WMV • OGV • and more."
+        )
+
+        await event.reply(
+            admin_guide
+        )
+
+    else:
+
+        welcome_text = (
+            "**👋 Welcome to MaxCinema Bot!**\n\n"
+            "🎬 I store and deliver video files "
+            "for the main channel.\n\n"
+            "Supported videos include:\n"
+            "MP4 • MKV • AVI • MOV • WEBM • M4V"
+        )
+
+        buttons = []
+
+        if CHANNEL_LINK:
+
+            buttons.append(
+                [
+                    Button.url(
+                        "📢 Join Main Channel",
+                        url=CHANNEL_LINK
+                    )
+                ]
+            )
+
+        buttons.append(
+            [
+                Button.inline(
+                    "📝 Request a Movie",
+                    data="help_request"
+                )
+            ]
+        )
+
+        await event.reply(
+            welcome_text,
+            buttons=buttons
+        )
+
+
+# ============================================================
+# REQUEST CALLBACK
+# ============================================================
+@bot.on(
+    events.CallbackQuery(
+        data="help_request"
+    )
+)
+async def callback_handler(event):
+
+    await event.answer(
+        "💡 TYPE:\n/request Movie Name",
+        alert=True
+    )
+
+
+# ============================================================
+# REQUEST
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/request"
+    )
+)
+async def request_handler(event):
+
+    query = (
+        event.text
+        .replace(
+            "/request",
+            "",
+            1
+        )
+        .strip()
+    )
+
+    sender = await event.get_sender()
+
+    if not query:
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/request Movie Name`"
+        )
+
+    status = await event.reply(
+        f"🔍 Searching for `{query}`..."
+    )
+
+    try:
+
+        msg_ids = search_vault(
+            query
+        )
+
+        if msg_ids:
+
+            messages = await bot.get_messages(
+                DB_CHANNEL_ID,
+                ids=msg_ids
+            )
+
+            if not isinstance(
+                messages,
+                list
+            ):
+
+                messages = [
+                    messages
+                ]
+
+            found = False
+            sent_messages = []
+
+            for msg in messages:
+
+                if (
+                    msg
+                    and msg.media
+                    and is_video_message(msg)
+                ):
+
+                    sent_file = (
+                        await bot.send_file(
+                            event.chat_id,
+                            msg.media,
+                            caption=msg.text
+                        )
+                    )
+
+                    sent_messages.append(
+                        sent_file
+                    )
+
+                    found = True
+
+            if found:
+
+                warning = await event.reply(
+                    "⏳ **SECURITY:** "
+                    f"*Videos auto-delete in "
+                    f"{AUTO_DELETE_SECONDS // 60} "
+                    "minutes.*"
+                )
+
+                sent_messages.append(
+                    warning
+                )
+
+                asyncio.create_task(
+                    auto_delete_task(
+                        event,
+                        sent_messages
+                    )
+                )
+
+                return await status.edit(
+                    "✅ **Here is what I found!**"
+                )
+
+        await status.edit(
+            "⚠️ Not found. "
+            "Forwarding request to admins..."
+        )
+
+        if AUTH_USERS:
+
+            first_name = (
+                getattr(
+                    sender,
+                    "first_name",
+                    "Unknown"
+                )
+                if sender
+                else "Unknown"
+            )
+
+            sender_id = (
+                sender.id
+                if sender
+                else "Unknown"
+            )
+
+            for admin_id in AUTH_USERS:
+
+                try:
+
+                    await bot.send_message(
+                        admin_id,
+                        (
+                            "📩 **NEW REQUEST!**\n\n"
+                            f"👤 {first_name}\n"
+                            f"🆔 `{sender_id}`\n"
+                            f"📝 `{query}`"
+                        )
+                    )
+
+                except Exception:
+                    pass
+
+            await event.reply(
+                "✅ **Request Sent to Admins!**"
+            )
+
+    except Exception as e:
+
+        await status.edit(
+            f"❌ Search error:\n`{e}`"
+        )
+
+
+# ============================================================
+# INDEX PRIVATE VAULT
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/indexvault$"
+    )
+)
+async def index_vault_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    status = await event.reply(
+        "🔄 **Starting video vault indexing...**"
+    )
+
+    count = 0
+    skipped = 0
+
+    try:
+
+        async for msg in bot.iter_messages(
+            DB_CHANNEL_ID,
+            limit=None
+        ):
+
+            if not msg or not msg.media:
+
+                skipped += 1
+                continue
+
+            # STRICT VIDEO CHECK
+            if not is_video_message(
+                msg
+            ):
+
+                skipped += 1
+                continue
+
+            file_name = (
+                get_message_filename_or_fallback(
+                    msg
+                )
+            )
+
+            if not file_name:
+
+                skipped += 1
+                continue
+
+            if not is_video_filename(
+                file_name
+            ):
+
+                skipped += 1
+                continue
+
+            if add_vault_item(
+                msg.id,
+                file_name
+            ):
+
+                count += 1
+
+            if count % 50 == 0:
+
+                await status.edit(
+                    f"🔄 Indexed `{count}` videos...\n"
+                    f"⏭️ Skipped: `{skipped}`"
+                )
+
+        await status.edit(
+            f"✅ **Video Indexing Complete**\n\n"
+            f"🎬 Indexed: `{count}` videos\n"
+            f"⏭️ Skipped: `{skipped}` non-videos"
+        )
+
+        if not USE_POSTGRES:
+
+            asyncio.create_task(
+                backup_database_to_tg()
+            )
+
+    except Exception as e:
+
+        await status.edit(
+            f"❌ Indexing failed:\n`{e}`"
+        )
+
+
+# ============================================================
+# STATS
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/stats$"
+    )
+)
+async def stats_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    users = get_user_count()
+    videos = get_vault_count()
+
+    await event.reply(
+        "📊 **Bot Statistics**\n\n"
+        f"👥 Users: **{users}**\n"
+        f"🎬 Videos: **{videos}**\n"
+        f"📥 Queue: **{WORK_QUEUE.qsize()}**"
+    )
+
+
+# ============================================================
+# BROADCAST
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/broadcast"
+    )
+)
+async def broadcast_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    msg = (
+        event.text
+        .replace(
+            "/broadcast",
+            "",
+            1
+        )
+        .strip()
+    )
+
+    if not msg:
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/broadcast Hello everyone!`"
+        )
+
+    users = get_all_users()
+
+    status = await event.reply(
+        f"🚀 Broadcasting to `{len(users)}` users..."
+    )
+
+    sent = 0
+
+    for user in users:
+
+        try:
+
+            await bot.send_message(
+                user,
+                msg
+            )
+
+            sent += 1
+
+            await asyncio.sleep(
+                0.1
+            )
+
+        except Exception:
+            pass
+
+    await status.edit(
+        "✅ **Broadcast Complete!**\n\n"
+        f"Delivered: `{sent}/{len(users)}`"
+    )
+
+
+# ============================================================
+# TMDB
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/tmdb"
+    )
+)
+async def tmdb_handler(event):
+
+    if event.sender_id not in AUTH_USERS:
+        return
+
+    query = (
+        event.text
+        .replace(
+            "/tmdb",
+            "",
+            1
+        )
+        .strip()
+    )
+
+    if not query:
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/tmdb Inception`"
+        )
+
+    if not TMDB_API_KEY:
+
+        return await event.reply(
+            "❌ TMDB_API_KEY is missing."
+        )
+
+    status = await event.reply(
+        "🔍 Fetching TMDB..."
+    )
+
+    try:
+
+        async with aiohttp.ClientSession() as session:
+
+            url = (
+                "https://api.themoviedb.org/3/"
+                "search/movie"
+            )
+
+            params = {
+                "api_key": TMDB_API_KEY,
+                "query": query
+            }
+
+            async with session.get(
+                url,
+                params=params
+            ) as response:
+
+                data = await response.json()
+
+        if not data.get(
+            "results"
+        ):
+
+            return await status.edit(
+                "❌ Movie not found."
+            )
+
+        movie = data[
+            "results"
+        ][0]
+
+        title = movie.get(
+            "title",
+            "Unknown"
+        )
+
+        year = (
+            movie.get(
+                "release_date",
+                ""
+            )
+            .split("-")[0]
+        )
+
+        rating = movie.get(
+            "vote_average",
+            "N/A"
+        )
+
+        overview = movie.get(
+            "overview",
+            "No summary."
+        )
+
+        poster_path = movie.get(
+            "poster_path"
+        )
+
+        poster_url = (
+            "https://image.tmdb.org/t/p/w500"
+            f"{poster_path}"
+            if poster_path
+            else None
+        )
+
+        caption = (
+            f"🎬 **{title} ({year})**\n\n"
+            f"⭐ **Rating:** {rating}/10\n\n"
+            f"📖 **Plot:** {overview}\n\n"
+            f"👇 **Download Below**"
+        )
+
+        if poster_url:
+
+            await bot.send_file(
+                event.chat_id,
+                poster_url,
+                caption=caption
+            )
+
+            await status.delete()
+
+        else:
+
+            await status.edit(
+                caption
+            )
+
+    except Exception as e:
+
+        await status.edit(
+            f"❌ TMDB error:\n`{e}`"
+        )
+
+
+# ============================================================
+# ADD VIDEO
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/add$"
+    )
+)
+async def add_handler(event):
+
+    sender = await event.get_sender()
+
+    if (
+        not AUTH_USERS
+        or sender.id not in AUTH_USERS
+    ):
+
         return
 
     reply = await event.get_reply_message()
+
     if not reply or not reply.media:
-        return await event.reply("❌ Please reply to a video or file.")
+
+        return await event.reply(
+            "❌ Reply to a video file.\n\n"
+            "🎬 Supported:\n"
+            "MP4 • MKV • AVI • MOV • WEBM • M4V"
+        )
+
+    # STRICT VIDEO CHECK
+    if not is_video_message(
+        reply
+    ):
+
+        return await event.reply(
+            "❌ This is not a supported video.\n\n"
+            "Photos, subtitles, PDFs, ZIPs, "
+            "and other documents are rejected.\n\n"
+            "🎬 Supported video formats:\n"
+            "MP4 • MKV • AVI • MOV • WEBM • M4V • "
+            "TS • MPEG • MPG • 3GP • FLV • WMV"
+        )
 
     try:
-        original_caption = reply.text or ""
-        vault_msg = await bot.send_file(DB_CHANNEL_ID, reply.media, caption=original_caption)
 
-        index_title = original_caption
-        if reply.file and hasattr(reply.file, "name") and reply.file.name:
-            index_title = f"{reply.file.name} {original_caption}"
-        if not index_title.strip():
-            index_title = f"Movie_File_{vault_msg.id}"
-
-        add_vault_item(vault_msg.id, index_title)
-
-        msg = (
-            f"✅ **File Added & Indexed!**\n\n"
-            f"📂 **Vault ID:** {vault_msg.id}\n"
-            f"👇 Reply with Photo + `/post` to publish."
+        original_caption = (
+            reply.text or ""
         )
-        await event.reply(msg)
-    except Exception as e:
-        await event.reply(f"❌ Error Adding: {e}")
 
-@bot.on(events.NewMessage(pattern="/postid"))
+        original_name = (
+            get_message_filename_or_fallback(
+                reply
+            )
+        )
+
+        if not original_name:
+
+            original_name = (
+                f"Video_{reply.id}.mp4"
+            )
+
+        if not is_video_filename(
+            original_name
+        ):
+
+            return await event.reply(
+                "❌ Video filename/format "
+                "could not be identified."
+            )
+
+        vault_msg = await bot.send_file(
+            DB_CHANNEL_ID,
+            reply.media,
+            caption=original_caption,
+            supports_streaming=True
+        )
+
+        if not is_video_message(
+            vault_msg
+        ):
+
+            try:
+                await vault_msg.delete()
+            except Exception:
+                pass
+
+            return await event.reply(
+                "❌ Vault rejected this media "
+                "because it is not a supported video."
+            )
+
+        index_title = (
+            f"{original_name} "
+            f"{original_caption}"
+        ).strip()
+
+        if not index_title:
+
+            index_title = (
+                original_name
+            )
+
+        if add_vault_item(
+            vault_msg.id,
+            original_name
+        ):
+
+            await event.reply(
+                "✅ **Video Added & Indexed!**\n\n"
+                f"📂 **Vault ID:** `{vault_msg.id}`\n"
+                f"🎬 **File:** `{original_name}`\n\n"
+                "👇 Reply with Photo + `/post` "
+                "to publish."
+            )
+
+        else:
+
+            await event.reply(
+                "❌ Video uploaded but database "
+                "indexing failed."
+            )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Error adding video:\n`{e}`"
+        )
+
+
+# ============================================================
+# POST ID
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/postid"
+    )
+)
 async def postid_handler(event):
+
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
+
+    if (
+        not AUTH_USERS
+        or sender.id not in AUTH_USERS
+    ):
+
         return
 
-    args = event.text.split(" ", 2)
+    args = event.text.split(
+        " ",
+        2
+    )
+
     if len(args) < 3:
-        return await event.reply("❌ Usage:\n`/postid 1234 Your Movie Caption`")
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/postid 1234 Your Movie Caption`"
+        )
 
     try:
-        vault_id = int(args[1])
-        caption = args[2].strip()
-    except ValueError:
-        return await event.reply("❌ ID must be a number.")
 
-    vault_msg = await get_vault_message(vault_id)
+        vault_id = int(
+            args[1]
+        )
+
+    except ValueError:
+
+        return await event.reply(
+            "❌ ID must be a number."
+        )
+
+    caption = args[2].strip()
+
+    vault_msg = await get_vault_message(
+        vault_id
+    )
+
     if not vault_msg:
-        return await event.reply("❌ That ID is not a valid file in the storage channel.")
+
+        return await event.reply(
+            "❌ That ID is not a valid "
+            "video in the PRIVATE storage channel."
+        )
 
     me = await bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start={vault_id}"
+
+    deep_link = (
+        f"https://t.me/"
+        f"{me.username}"
+        f"?start={vault_id}"
+    )
 
     buttons = []
-    if WEBSITE_HOME:
-        buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
-    buttons.append([Button.url("📂 Get File", url=deep_link)])
 
-    poster = await event.download_media() if event.photo else None
+    if WEBSITE_HOME:
+
+        buttons.append(
+            [
+                Button.url(
+                    "🌍 Visit Website",
+                    url=WEBSITE_HOME
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            Button.url(
+                "📂 Get File",
+                url=deep_link
+            )
+        ]
+    )
+
+    poster = (
+        await event.download_media()
+        if event.photo
+        else None
+    )
+
     if not poster:
-        reply = await event.get_reply_message()
+
+        reply = (
+            await event.get_reply_message()
+        )
+
         if reply and reply.photo:
-            poster = await reply.download_media()
+
+            poster = (
+                await reply.download_media()
+            )
 
     try:
-        public_msg = await send_public_card(caption, buttons, poster)
-        save_public_mapping(public_msg.id, vault_id)
-        await event.reply(f"✅ Published.\n🆔 Vault ID: `{vault_id}`")
-    except Exception as e:
-        await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern="/postpack"))
+        public_msg = (
+            await send_public_card(
+                caption,
+                buttons,
+                poster
+            )
+        )
+
+        save_public_mapping(
+            public_msg.id,
+            vault_id
+        )
+
+        await event.reply(
+            "✅ **Published!**\n\n"
+            f"🆔 Vault ID: `{vault_id}`"
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Error:\n`{e}`"
+        )
+
+
+# ============================================================
+# POST PACK
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/postpack"
+    )
+)
 async def postpack_handler(event):
+
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
+
+    if (
+        not AUTH_USERS
+        or sender.id not in AUTH_USERS
+    ):
+
         return
 
     args = event.text.split()
+
     if len(args) < 2:
-        return await event.reply("❌ Usage: `/postpack 100-107 Caption`")
+
+        return await event.reply(
+            "❌ Usage:\n"
+            "`/postpack 100-107 Caption`"
+        )
 
     range_str = args[1]
-    try:
-        start_id, end_id = range_str.split("-")
-    except Exception:
-        return await event.reply("❌ Invalid Format. Use `100-107`")
 
-    caption = event.text.replace("/postpack", "").replace(range_str, "").strip() or "🎬 **New Season Pack!**"
+    try:
+
+        start_id, end_id = (
+            range_str.split("-")
+        )
+
+        start_id = int(
+            start_id
+        )
+
+        end_id = int(
+            end_id
+        )
+
+    except Exception:
+
+        return await event.reply(
+            "❌ Invalid format.\n"
+            "Use `100-107`."
+        )
+
+    caption = (
+        event.text
+        .replace(
+            "/postpack",
+            "",
+            1
+        )
+        .replace(
+            range_str,
+            "",
+            1
+        )
+        .strip()
+        or
+        "🎬 **New Season Pack!**"
+    )
 
     me = await bot.get_me()
-    pack_link = f"https://t.me/{me.username}?start=pack_{start_id}_{end_id}"
 
-    buttons = [[Button.url("📂 Get Full Season", url=pack_link)]]
+    pack_link = (
+        f"https://t.me/"
+        f"{me.username}"
+        f"?start=pack_"
+        f"{start_id}_"
+        f"{end_id}"
+    )
+
+    buttons = [
+        [
+            Button.url(
+                "📂 Get Full Season",
+                url=pack_link
+            )
+        ]
+    ]
+
     if WEBSITE_HOME:
-        buttons.insert(0, [Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
 
-    poster = await event.download_media() if event.photo else None
+        buttons.insert(
+            0,
+            [
+                Button.url(
+                    "🌍 Visit Website",
+                    url=WEBSITE_HOME
+                )
+            ]
+        )
+
+    poster = (
+        await event.download_media()
+        if event.photo
+        else None
+    )
 
     try:
+
         ok_count = 0
-        for item_id in range(int(start_id), int(end_id) + 1):
-            if await get_vault_message(item_id):
+
+        for item_id in range(
+            start_id,
+            end_id + 1
+        ):
+
+            if await get_vault_message(
+                item_id
+            ):
+
                 ok_count += 1
 
         if ok_count == 0:
-            return await event.reply("❌ None of those IDs exist in the storage channel.")
 
-        public_msg = await send_public_card(caption, buttons, poster)
-        save_public_mapping(public_msg.id, int(start_id))
-        await event.reply(f"✅ Pack Published!\n🔗 **Link:** {pack_link}")
+            return await event.reply(
+                "❌ None of those IDs "
+                "contain videos."
+            )
+
+        public_msg = (
+            await send_public_card(
+                caption,
+                buttons,
+                poster
+            )
+        )
+
+        save_public_mapping(
+            public_msg.id,
+            start_id
+        )
+
+        await event.reply(
+            "✅ **Pack Published!**\n\n"
+            f"🎬 Videos available: `{ok_count}`\n"
+            f"🔗 {pack_link}"
+        )
+
     except Exception as e:
-        await event.reply(f"❌ Error: {e}")
 
-@bot.on(events.NewMessage(pattern="/post"))
+        await event.reply(
+            f"❌ Error:\n`{e}`"
+        )
+
+
+# ============================================================
+# POST
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/post(?!id|pack)"
+    )
+)
 async def post_handler(event):
-    if "/postpack" in event.text or "/postid" in event.text:
-        return
 
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
+
+    if (
+        not AUTH_USERS
+        or sender.id not in AUTH_USERS
+    ):
+
         return
 
     reply = await event.get_reply_message()
+
     if not reply:
-        return await event.reply("⚠️ Reply to a Vault ID message.")
+
+        return await event.reply(
+            "⚠️ Reply to a Vault ID message."
+        )
 
     vault_id = None
-    for line in (reply.text or "").split("\n"):
+
+    for line in (
+        reply.text or ""
+    ).split("\n"):
+
         if "Vault ID:" in line:
-            vault_id = re.sub(r"[^0-9]", "", line.split("Vault ID:")[1])
+
+            vault_id = re.sub(
+                r"[^0-9]",
+                "",
+                line.split(
+                    "Vault ID:",
+                    1
+                )[1]
+            )
 
     if not vault_id:
-        return await event.reply("❌ Invalid: No Vault ID found.")
 
-    vault_msg = await get_vault_message(int(vault_id))
+        return await event.reply(
+            "❌ No Vault ID found."
+        )
+
+    vault_msg = await get_vault_message(
+        int(vault_id)
+    )
+
     if not vault_msg:
-        return await event.reply("❌ That Vault ID does not exist in the storage channel.")
 
-    caption = event.text.replace("/post", "").strip() or "🎬 **New Movie Uploaded!**"
+        return await event.reply(
+            "❌ Vault ID does not exist "
+            "or is not a video."
+        )
+
+    caption = (
+        event.text
+        .replace(
+            "/post",
+            "",
+            1
+        )
+        .strip()
+        or
+        "🎬 **New Movie Uploaded!**"
+    )
 
     me = await bot.get_me()
-    deep_link = f"https://t.me/{me.username}?start={vault_id}"
+
+    deep_link = (
+        f"https://t.me/"
+        f"{me.username}"
+        f"?start={vault_id}"
+    )
 
     buttons = []
-    if WEBSITE_HOME:
-        buttons.append([Button.url("🌍 Visit Website", url=WEBSITE_HOME)])
-    buttons.append([Button.url("📂 Get File", url=deep_link)])
 
-    poster = await event.download_media() if event.photo else None
+    if WEBSITE_HOME:
+
+        buttons.append(
+            [
+                Button.url(
+                    "🌍 Visit Website",
+                    url=WEBSITE_HOME
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            Button.url(
+                "📂 Get File",
+                url=deep_link
+            )
+        ]
+    )
+
+    poster = (
+        await event.download_media()
+        if event.photo
+        else None
+    )
 
     try:
-        public_msg = await send_public_card(caption, buttons, poster)
-        save_public_mapping(public_msg.id, int(vault_id))
-        await event.reply(f"✅ Published!\n🆔 Vault ID: `{vault_id}`")
-    except Exception as e:
-        await event.reply(f"❌ Error: {e}")
 
-# ==========================================
-# 🧠 CORE PROCESSOR
-# ==========================================
-async def process_task(event, source, name, thumb_path):
-    status_msg = await event.reply(f"⏳ **Initializing:** `{name}`...")
+        public_msg = (
+            await send_public_card(
+                caption,
+                buttons,
+                poster
+            )
+        )
+
+        save_public_mapping(
+            public_msg.id,
+            int(vault_id)
+        )
+
+        await event.reply(
+            "✅ **Published!**\n\n"
+            f"🆔 Vault ID: `{vault_id}`"
+        )
+
+    except Exception as e:
+
+        await event.reply(
+            f"❌ Error:\n`{e}`"
+        )
+
+
+# ============================================================
+# CORE MIRROR PROCESSOR
+# ============================================================
+async def process_task(
+    event,
+    source,
+    name,
+    thumb_path
+):
+
+    name = sanitize_filename(
+        name
+    )
+
+    if not is_video_filename(
+        name
+    ):
+
+        await event.reply(
+            f"❌ Rejected `{name}`\n\n"
+            "Only supported video formats "
+            "can be mirrored."
+        )
+
+        return False
+
+    status_msg = await event.reply(
+        f"⏳ **Initializing:** `{name}`..."
+    )
+
     last_time = [0]
+
     current_thumb = thumb_path
 
     try:
-        if isinstance(source, str):
-            await status_msg.edit("🚀 **Downloading URL...**")
-            headers = {"User-Agent": "Mozilla/5.0"}
-            timeout = aiohttp.ClientTimeout(total=3600)
 
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(source, headers=headers) as resp:
-                    if resp.status == 200:
-                        total = int(resp.headers.get("content-length", 0))
-                        current = 0
-                        async with aiofiles.open(name, mode="wb") as f:
-                            async for chunk in resp.content.iter_chunked(10 * 1024 * 1024):
-                                await f.write(chunk)
-                                current += len(chunk)
-                                await progress_bar(current, total, status_msg, "⬇️ **Downloading...**", last_time)
-                    else:
-                        await status_msg.edit(f"❌ Error: Server returned {resp.status}")
+        # ----------------------------------------------------
+        # URL SOURCE
+        # ----------------------------------------------------
+        if isinstance(
+            source,
+            str
+        ):
+
+            await status_msg.edit(
+                "🚀 **Downloading video URL...**"
+            )
+
+            headers = {
+                "User-Agent":
+                "Mozilla/5.0"
+            }
+
+            timeout = aiohttp.ClientTimeout(
+                total=3600
+            )
+
+            async with aiohttp.ClientSession(
+                timeout=timeout
+            ) as session:
+
+                async with session.get(
+                    source,
+                    headers=headers,
+                    allow_redirects=True
+                ) as resp:
+
+                    if resp.status != 200:
+
+                        await status_msg.edit(
+                            f"❌ Server returned "
+                            f"`{resp.status}`"
+                        )
+
                         return False
-        else:
-            await status_msg.edit("📥 **Downloading from Telegram...**")
 
-            async def dl_callback(c, t):
-                await progress_bar(c, t, status_msg, "📥 **Downloading...**", last_time)
+                    content_type = (
+                        resp.headers.get(
+                            "Content-Type",
+                            ""
+                        ).lower()
+                    )
 
-            success = await smart_download(bot, source, name, dl_callback)
-            if not success:
+                    # If the server explicitly says
+                    # image/pdf/text, reject it.
+                    if (
+                        content_type.startswith(
+                            "image/"
+                        )
+                        or
+                        content_type.startswith(
+                            "text/"
+                        )
+                        or
+                        "application/pdf"
+                        in content_type
+                    ):
+
+                        await status_msg.edit(
+                            "❌ URL is not a video."
+                        )
+
+                        return False
+
+                    total = int(
+                        resp.headers.get(
+                            "content-length",
+                            0
+                        )
+                    )
+
+                    current = 0
+
+                    async with aiofiles.open(
+                        name,
+                        "wb"
+                    ) as f:
+
+                        async for chunk in (
+                            resp.content.iter_chunked(
+                                10 * 1024 * 1024
+                            )
+                        ):
+
+                            await f.write(
+                                chunk
+                            )
+
+                            current += len(
+                                chunk
+                            )
+
+                            await progress_bar(
+                                current,
+                                total,
+                                status_msg,
+                                "⬇️ **Downloading...**",
+                                last_time
+                            )
+
+            if not os.path.exists(
+                name
+            ):
+
+                await status_msg.edit(
+                    "❌ Download produced no file."
+                )
+
                 return False
 
-        if not current_thumb:
-            generated_thumb = f"{name}_thumb.jpg"
-            cmd = ["ffmpeg", "-i", name, "-ss", "00:00:05", "-vframes", "1", generated_thumb, "-y"]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
+            if os.path.getsize(
+                name
+            ) <= 0:
+
+                await status_msg.edit(
+                    "❌ Downloaded file is empty."
+                )
+
+                return False
+
+        # ----------------------------------------------------
+        # TELEGRAM SOURCE
+        # ----------------------------------------------------
+        else:
+
+            if not is_video_message(
+                source
+            ):
+
+                await status_msg.edit(
+                    "❌ Telegram source is not "
+                    "a supported video."
+                )
+
+                return False
+
+            await status_msg.edit(
+                "📥 **Downloading video "
+                "from Telegram...**"
             )
+
+            async def dl_callback(
+                current,
+                total
+            ):
+
+                await progress_bar(
+                    current,
+                    total,
+                    status_msg,
+                    "📥 **Downloading...**",
+                    last_time
+                )
+
+            success = await smart_download(
+                bot,
+                source,
+                name,
+                dl_callback
+            )
+
+            if not success:
+
+                await status_msg.edit(
+                    "❌ Telegram video "
+                    "download failed."
+                )
+
+                return False
+
+        # ----------------------------------------------------
+        # GENERATE THUMBNAIL
+        # ----------------------------------------------------
+        if not current_thumb:
+
+            generated_thumb = (
+                f"{name}_thumb.jpg"
+            )
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "00:00:05",
+                "-i",
+                name,
+                "-frames:v",
+                "1",
+                "-y",
+                generated_thumb
+            ]
+
+            process = (
+                await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+            )
+
             try:
-                await asyncio.wait_for(process.wait(), timeout=30.0)
+
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=30
+                )
+
             except asyncio.TimeoutError:
-                process.kill()
 
-            if os.path.exists(generated_thumb):
-                current_thumb = generated_thumb
+                try:
+                    process.kill()
+                except Exception:
+                    pass
 
-        await status_msg.edit("⚡ **Uploading to Vault...**")
+            if os.path.exists(
+                generated_thumb
+            ):
+
+                current_thumb = (
+                    generated_thumb
+                )
+
+        # ----------------------------------------------------
+        # UPLOAD TO PRIVATE VAULT
+        # ----------------------------------------------------
+        await status_msg.edit(
+            "⚡ **Uploading video to Vault...**"
+        )
+
         last_time = [0]
 
-        async def up_callback(c, t):
-            await progress_bar(c, t, status_msg, "☁️ **Uploading to Vault...**", last_time)
+        async def up_callback(
+            current,
+            total
+        ):
+
+            await progress_bar(
+                current,
+                total,
+                status_msg,
+                "☁️ **Uploading to Vault...**",
+                last_time
+            )
 
         try:
+
             vault_msg = await bot.send_file(
                 DB_CHANNEL_ID,
                 file=name,
@@ -1016,117 +4769,952 @@ async def process_task(event, source, name, thumb_path):
                 supports_streaming=True,
                 progress_callback=up_callback
             )
-            add_vault_item(vault_msg.id, name)
-        except Exception:
+
+        except Exception as e:
+
+            await status_msg.edit(
+                f"❌ Vault upload failed:\n`{e}`"
+            )
+
             return False
 
-        stream_url = f"{BASE_URL}/stream/{vault_msg.id}" if BASE_URL else "N/A"
-        final_msg = (
-            f"✅ **Mirror Complete!**\n\n"
-            f"📂 **Vault ID:** {vault_msg.id}\n"
-            f"🌐 **Stream:** {stream_url}\n\n"
-            f"👇 Reply with Photo + `/post` to publish."
+        if not is_video_message(
+            vault_msg
+        ):
+
+            try:
+                await vault_msg.delete()
+            except Exception:
+                pass
+
+            await status_msg.edit(
+                "❌ Uploaded item was not "
+                "recognized as a video."
+            )
+
+            return False
+
+        add_vault_item(
+            vault_msg.id,
+            name
         )
-        await status_msg.edit(final_msg)
+
+        # ----------------------------------------------------
+        # OPTIONAL DOOD UPLOAD
+        # ----------------------------------------------------
+        dood_link = None
+
+        if DOOD_KEY:
+
+            await status_msg.edit(
+                "⚡ **Uploading to Doodstream...**"
+            )
+
+            try:
+
+                async with aiohttp.ClientSession() as session:
+
+                    api_url = (
+                        "https://doodapi.co/api/"
+                        "upload/server"
+                    )
+
+                    async with session.get(
+                        api_url,
+                        params={
+                            "key": DOOD_KEY
+                        }
+                    ) as response:
+
+                        data = await response.json()
+
+                    if data.get(
+                        "status"
+                    ) == 200:
+
+                        upload_url = (
+                            data.get(
+                                "result"
+                            )
+                        )
+
+                        if upload_url:
+
+                            form = aiohttp.FormData()
+
+                            with open(
+                                name,
+                                "rb"
+                            ) as file_handle:
+
+                                form.add_field(
+                                    "api_key",
+                                    DOOD_KEY
+                                )
+
+                                form.add_field(
+                                    "file",
+                                    file_handle,
+                                    filename=name
+                                )
+
+                                async with session.post(
+                                    upload_url,
+                                    data=form,
+                                    timeout=7200
+                                ) as response:
+
+                                    dood_data = (
+                                        await response.json()
+                                    )
+
+                            if (
+                                dood_data.get(
+                                    "status"
+                                )
+                                == 200
+                            ):
+
+                                result = (
+                                    dood_data.get(
+                                        "result",
+                                        []
+                                    )
+                                )
+
+                                if result:
+
+                                    raw_link = (
+                                        result[0].get(
+                                            "download_url"
+                                        )
+                                    )
+
+                                    dood_link = (
+                                        fix_dood_link(
+                                            raw_link
+                                        )
+                                    )
+
+            except Exception as e:
+
+                print(
+                    f"Dood upload failed: {e}"
+                )
+
+        # ----------------------------------------------------
+        # FINAL
+        # ----------------------------------------------------
+        stream_url = (
+            f"{BASE_URL}/stream/"
+            f"{vault_msg.id}"
+            if BASE_URL
+            else "N/A"
+        )
+
+        final_msg = (
+            "✅ **Mirror Complete!**\n\n"
+            f"📂 **Vault ID:** "
+            f"`{vault_msg.id}`\n"
+            f"🎬 **File:** `{name}`\n"
+            f"📦 **Size:** "
+            f"`{human_size(os.path.getsize(name))}`\n"
+            f"🌐 **Stream:** {stream_url}\n"
+        )
+
+        if dood_link:
+
+            final_msg += (
+                f"🔗 **Dood:** {dood_link}\n"
+            )
+
+        final_msg += (
+            "\n👇 Reply with Photo + `/post` "
+            "to publish."
+        )
+
+        await status_msg.edit(
+            final_msg
+        )
+
         return True
 
     except Exception as e:
-        await status_msg.edit(f"❌ Error: {str(e)}")
+
+        try:
+
+            await status_msg.edit(
+                f"❌ Error:\n`{e}`"
+            )
+
+        except Exception:
+            pass
+
         return False
 
     finally:
-        if os.path.exists(name):
+
+        if os.path.exists(
+            name
+        ):
+
             try:
-                os.remove(name)
-            except Exception:
-                pass
-        if current_thumb and current_thumb != thumb_path and os.path.exists(current_thumb):
-            try:
-                os.remove(current_thumb)
+                os.remove(
+                    name
+                )
             except Exception:
                 pass
 
-@bot.on(events.NewMessage(pattern="/mirror"))
+        if (
+            current_thumb
+            and current_thumb != thumb_path
+            and os.path.exists(
+                current_thumb
+            )
+        ):
+
+            try:
+                os.remove(
+                    current_thumb
+                )
+            except Exception:
+                pass
+
+
+# ============================================================
+# QUEUE WORKER
+# ============================================================
+async def worker(
+    worker_id=1
+):
+
+    print(
+        f"👷 Queue Worker {worker_id} Started"
+    )
+
+    while True:
+
+        task_data = (
+            await WORK_QUEUE.get()
+        )
+
+        event, source, name, thumb_path = (
+            task_data
+        )
+
+        try:
+
+            await process_task(
+                event,
+                source,
+                name,
+                thumb_path
+            )
+
+        except Exception as e:
+
+            print(
+                f"Worker {worker_id} failed: {e}"
+            )
+
+            try:
+
+                await event.reply(
+                    f"❌ Task failed:\n`{e}`"
+                )
+
+            except Exception:
+                pass
+
+        finally:
+
+            WORK_QUEUE.task_done()
+
+            await asyncio.sleep(
+                2
+            )
+
+
+# ============================================================
+# MIRROR COMMAND
+# ============================================================
+@bot.on(
+    events.NewMessage(
+        pattern=r"^/mirror"
+    )
+)
 async def handler(event):
+
     sender = await event.get_sender()
-    if not AUTH_USERS or sender.id not in AUTH_USERS:
+
+    if (
+        not AUTH_USERS
+        or sender.id not in AUTH_USERS
+    ):
+
         return
 
     reply = await event.get_reply_message()
-    batch_thumb = await event.download_media() if event.photo else (await reply.download_media() if reply and reply.photo else None)
+
+    batch_thumb = (
+        await event.download_media()
+        if event.photo
+        else (
+            await reply.download_media()
+            if reply and reply.photo
+            else None
+        )
+    )
 
     tasks = []
-    if reply and (reply.video or reply.document) and not reply.photo:
-        parts = event.text.split(" ", 1)
-        new_name = parts[1] if len(parts) > 1 else f"Video_{int(time.time())}.mp4"
-        tasks.append((reply, new_name))
+
+    # --------------------------------------------------------
+    # Reply to Telegram video
+    # --------------------------------------------------------
+    if (
+        reply
+        and is_video_message(reply)
+    ):
+
+        parts = event.text.split(
+            " ",
+            1
+        )
+
+        requested_name = (
+            parts[1].strip()
+            if len(parts) > 1
+            else get_message_filename_or_fallback(
+                reply
+            )
+        )
+
+        requested_name = sanitize_filename(
+            requested_name
+        )
+
+        if not is_video_filename(
+            requested_name
+        ):
+
+            # If user did not explicitly provide
+            # an extension, use Telegram's extension.
+            original_name = (
+                get_message_filename_or_fallback(
+                    reply
+                )
+            )
+
+            if is_video_filename(
+                original_name
+            ):
+
+                requested_name = (
+                    original_name
+                )
+
+        if not is_video_filename(
+            requested_name
+        ):
+
+            return await event.reply(
+                "❌ Please provide a valid "
+                "video filename.\n\n"
+                "Example:\n"
+                "`/mirror Movie.mkv`"
+            )
+
+        tasks.append(
+            (
+                reply,
+                requested_name
+            )
+        )
+
+    # --------------------------------------------------------
+    # URL pairs
+    #
+    # /mirror url1 name1.mp4 url2 name2.mkv
+    # --------------------------------------------------------
     else:
+
         parts = event.text.split()
-        for i in range(1, len(parts), 2):
-            if i + 1 < len(parts):
-                tasks.append((parts[i], parts[i + 1]))
+
+        if (
+            len(parts) > 1
+            and (
+                len(parts[1:])
+                % 2 != 0
+            )
+        ):
+
+            return await event.reply(
+                "❌ Each URL must have "
+                "a filename.\n\n"
+                "Example:\n"
+                "`/mirror URL1 Movie.mp4`"
+            )
+
+        for i in range(
+            1,
+            len(parts),
+            2
+        ):
+
+            if i + 1 >= len(parts):
+                break
+
+            source = parts[i]
+            name = sanitize_filename(
+                parts[i + 1]
+            )
+
+            if not is_video_filename(
+                name
+            ):
+
+                continue
+
+            tasks.append(
+                (
+                    source,
+                    name
+                )
+            )
 
     if not tasks:
-        return await event.reply("Usage: `/mirror link1 name1 link2 name2...`")
 
-    q_size = WORK_QUEUE.qsize()
-    await event.reply(f"📥 **Added to Queue**\nPosition: {q_size + 1}")
+        return await event.reply(
+            "❌ No valid videos found.\n\n"
+            "Usage:\n"
+            "`/mirror link1 movie.mp4`\n\n"
+            "Or reply to a video:\n"
+            "`/mirror Movie.mkv`\n\n"
+            "Supported:\n"
+            "MP4 • MKV • AVI • MOV • WEBM • "
+            "M4V • TS • MPEG • MPG • 3GP • "
+            "FLV • WMV • OGV"
+        )
+
+    position = (
+        WORK_QUEUE.qsize()
+        + 1
+    )
+
+    await event.reply(
+        f"📥 **Added to Queue**\n"
+        f"🎬 Videos: `{len(tasks)}`\n"
+        f"📍 Position: `{position}`"
+    )
 
     for source, name in tasks:
-        await WORK_QUEUE.put((event, source, name, batch_thumb))
 
+        await WORK_QUEUE.put(
+            (
+                event,
+                source,
+                name,
+                batch_thumb
+            )
+        )
+
+
+# ============================================================
+# WEB STREAMING
+# ============================================================
+async def stream_handler(
+    request
+):
+
+    async with STREAM_SEMAPHORE:
+
+        try:
+
+            msg_id = int(
+                request.match_info[
+                    "msg_id"
+                ]
+            )
+
+            message = await bot.get_messages(
+                DB_CHANNEL_ID,
+                ids=msg_id
+            )
+
+            if (
+                not message
+                or not message.file
+                or not is_video_message(message)
+            ):
+
+                return web.Response(
+                    status=404,
+                    text="Video not found"
+                )
+
+            file_name = (
+                get_message_filename(
+                    message
+                )
+                or
+                "video.mp4"
+            )
+
+            file_name = sanitize_filename(
+                file_name
+            )
+
+            file_size = (
+                getattr(
+                    message.document,
+                    "size",
+                    None
+                )
+            )
+
+            if not file_size:
+
+                return web.Response(
+                    status=404,
+                    text="Video size unavailable"
+                )
+
+            mime_type = (
+                getattr(
+                    message.document,
+                    "mime_type",
+                    None
+                )
+                or
+                mimetypes.guess_type(
+                    file_name
+                )[0]
+                or
+                "video/mp4"
+            )
+
+            range_header = (
+                request.headers.get(
+                    "Range"
+                )
+            )
+
+            start = 0
+            end = file_size - 1
+
+            if range_header:
+
+                match = re.match(
+                    r"bytes=(\d*)-(\d*)",
+                    range_header
+                )
+
+                if not match:
+
+                    return web.Response(
+                        status=416
+                    )
+
+                start_raw = (
+                    match.group(1)
+                )
+
+                end_raw = (
+                    match.group(2)
+                )
+
+                if (
+                    not start_raw
+                    and not end_raw
+                ):
+
+                    return web.Response(
+                        status=416
+                    )
+
+                # bytes=-500000
+                if not start_raw:
+
+                    suffix_length = int(
+                        end_raw
+                    )
+
+                    if suffix_length <= 0:
+
+                        return web.Response(
+                            status=416
+                        )
+
+                    start = max(
+                        file_size
+                        - suffix_length,
+                        0
+                    )
+
+                else:
+
+                    start = int(
+                        start_raw
+                    )
+
+                    if end_raw:
+
+                        end = min(
+                            int(end_raw),
+                            file_size - 1
+                        )
+
+            if start >= file_size:
+
+                response = web.Response(
+                    status=416
+                )
+
+                response.headers[
+                    "Content-Range"
+                ] = (
+                    f"bytes */{file_size}"
+                )
+
+                return response
+
+            end = min(
+                end,
+                file_size - 1
+            )
+
+            if end < start:
+
+                response = web.Response(
+                    status=416
+                )
+
+                response.headers[
+                    "Content-Range"
+                ] = (
+                    f"bytes */{file_size}"
+                )
+
+                return response
+
+            content_length = (
+                end
+                - start
+                + 1
+            )
+
+            status_code = (
+                206
+                if range_header
+                else 200
+            )
+
+            response = web.StreamResponse(
+                status=status_code
+            )
+
+            response.headers[
+                "Content-Type"
+            ] = mime_type
+
+            response.headers[
+                "Accept-Ranges"
+            ] = "bytes"
+
+            response.headers[
+                "Content-Length"
+            ] = str(
+                content_length
+            )
+
+            if range_header:
+
+                response.headers[
+                    "Content-Range"
+                ] = (
+                    f"bytes {start}-{end}/"
+                    f"{file_size}"
+                )
+
+            response.headers[
+                "Content-Disposition"
+            ] = (
+                'inline; filename="'
+                f'{file_name}"'
+            )
+
+            response.headers[
+                "Cache-Control"
+            ] = (
+                "public, max-age=3600"
+            )
+
+            await response.prepare(
+                request
+            )
+
+            # HEAD requests should return
+            # headers but no body.
+            if request.method == "HEAD":
+
+                await response.write_eof()
+
+                return response
+
+            # Align Telegram download offset
+            # to the 1MB boundary.
+            offset_limit = (
+                STREAM_CHUNK_SIZE
+            )
+
+            chunk_start = (
+                start
+                - (
+                    start
+                    % offset_limit
+                )
+            )
+
+            remaining = (
+                content_length
+            )
+
+            async for chunk in bot.iter_download(
+                message.media,
+                offset=chunk_start,
+                request_size=offset_limit
+            ):
+
+                if chunk_start < start:
+
+                    slice_start = (
+                        start
+                        - chunk_start
+                    )
+
+                    chunk = chunk[
+                        slice_start:
+                    ]
+
+                    chunk_start = start
+
+                if len(chunk) > remaining:
+
+                    chunk = chunk[
+                        :remaining
+                    ]
+
+                if not chunk:
+                    break
+
+                await response.write(
+                    chunk
+                )
+
+                remaining -= len(
+                    chunk
+                )
+
+                chunk_start += len(
+                    chunk
+                )
+
+                if remaining <= 0:
+                    break
+
+            await response.write_eof()
+
+            return response
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception as e:
+
+            print(
+                f"Streaming error: {e}"
+            )
+
+            return web.Response(
+                status=500,
+                text="Streaming error"
+            )
+
+
+# ============================================================
+# WEB ROOT
+# ============================================================
+async def root_handler(
+    request
+):
+
+    return web.Response(
+        text=(
+            "🚀 MaxCinema Bot is Running\n"
+            "🎬 Video Streaming Service"
+        )
+    )
+
+
+# ============================================================
+# WEB HEALTH
+# ============================================================
+async def web_health_handler(
+    request
+):
+
+    return web.json_response(
+        {
+            "status": "ok",
+            "service": "MaxCinema",
+            "database": (
+                "postgresql"
+                if USE_POSTGRES
+                else "sqlite"
+            ),
+            "videos": get_vault_count(),
+            "queue": WORK_QUEUE.qsize(),
+        }
+    )
+
+
+# ============================================================
+# WEB SERVER
+# ============================================================
 async def start_web_server():
-    app = web.Application()
-    app.add_routes([
-        web.get("/", root_handler),
-        web.get("/stream/{msg_id}", stream_handler)
-    ])
-    runner = web.AppRunner(app)
+
+    app = web.Application(
+        client_max_size=1024 ** 4
+    )
+
+    app.add_routes(
+        [
+            web.get(
+                "/",
+                root_handler
+            ),
+            web.get(
+                "/health",
+                web_health_handler
+            ),
+            web.get(
+                "/stream/{msg_id}",
+                stream_handler
+            ),
+            web.head(
+                "/stream/{msg_id}",
+                stream_handler
+            )
+        ]
+    )
+
+    runner = web.AppRunner(
+        app,
+        access_log=None
+    )
+
     await runner.setup()
 
-    port = int(os.environ.get("PORT", 10000))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    print(f"✅ Web Server Started on Port {port}")
-
-@bot.on(events.NewMessage(pattern="/checkchannel"))
-async def check_channel_handler(event):
-    if event.sender_id not in AUTH_USERS:
-        return
-    try:
-        channel = await bot.get_entity(DB_CHANNEL_ID)
-        await event.reply(
-            f"✅ **Storage Channel Verified!**\n\n"
-            f"🏷️ **Name:** {channel.title}\n"
-            f"🆔 **ID:** `{DB_CHANNEL_ID}`"
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
         )
-    except Exception as e:
-        await event.reply(f"❌ Could not find channel! Check your DB_CHANNEL_ID.\nError: {e}")
+    )
 
-@bot.on(events.NewMessage(pattern="/checkdb"))
-async def check_db_handler(event):
-    if USE_POSTGRES:
-        conn = get_pg_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM vault")
-        count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
-        await event.reply(f"🐘 Postgres Database contains {count} items in 'vault'.")
-    else:
-        sqlite_cursor.execute("SELECT COUNT(*) FROM vault")
-        count = sqlite_cursor.fetchone()[0]
-        await event.reply(f"💾 SQLite Database contains {count} items in 'vault'.")
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port
+    )
 
-async def startup_sequence():
+    await site.start()
+
+    print(
+        f"✅ Web Server Started "
+        f"on Port {port}"
+    )
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+async def startup_tasks():
+
     await sync_database_from_tg()
-    if USE_POSTGRES:
-        init_postgres()
-    else:
-        init_sqlite()
 
+    asyncio.create_task(
+        start_web_server()
+    )
+
+    for i in range(
+        QUEUE_WORKERS
+    ):
+
+        asyncio.create_task(
+            worker(
+                i + 1
+            )
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 if __name__ == "__main__":
-    bot.start(bot_token=BOT_TOKEN)
-    bot.loop.run_until_complete(startup_sequence())
-    bot.loop.create_task(start_web_server())
-    bot.loop.create_task(worker())
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        "🎬 MAXCINEMA VIDEO BOT"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"🔒 Private Vault: "
+        f"{DB_CHANNEL_ID}"
+    )
+
+    print(
+        f"📦 Public Migration Source: "
+        f"{PUBLIC_DB_CHANNEL_ID}"
+    )
+
+    print(
+        f"🐘 PostgreSQL: "
+        f"{USE_POSTGRES}"
+    )
+
+    print(
+        f"👷 Queue Workers: "
+        f"{QUEUE_WORKERS}"
+    )
+
+    print(
+        f"🌐 Stream Concurrency: "
+        f"{STREAM_CONCURRENCY}"
+    )
+
+    print(
+        "🎬 Video-only mode: ENABLED"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    bot.start(
+        bot_token=BOT_TOKEN
+    )
+
+    bot.loop.run_until_complete(
+        startup_tasks()
+    )
+
     bot.run_until_disconnected()
