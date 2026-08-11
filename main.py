@@ -2173,6 +2173,90 @@ async def auto_delete_task(
         pass
 
 
+def get_file_size(message):
+    """
+    Best-effort file size lookup from a sent/received message.
+    """
+
+    try:
+
+        if getattr(message, "file", None):
+
+            size = getattr(
+                message.file,
+                "size",
+                None
+            )
+
+            if size:
+                return size
+
+    except Exception:
+        pass
+
+    try:
+
+        document = getattr(
+            message,
+            "document",
+            None
+        )
+
+        if document:
+
+            return getattr(
+                document,
+                "size",
+                None
+            )
+
+    except Exception:
+        pass
+
+    return None
+
+
+def auto_delete_delay_for_size(
+    total_bytes,
+    min_delay=AUTO_DELETE_SECONDS,
+    max_delay=7200,
+    assumed_speed_mbps=2,
+    buffer_seconds=120
+):
+    """
+    Scales the auto-delete window to the file size instead of
+    using one fixed delay for everything.
+
+    - assumed_speed_mbps is intentionally conservative (2 MB/s,
+      ~16 Mbps) to cover slower/mobile connections rather than
+      best-case wifi.
+    - buffer_seconds adds slack on top of the raw download-time
+      estimate so people aren't racing the clock.
+    - min_delay is a floor: small files never get an
+      uncomfortably short window (defaults to AUTO_DELETE_SECONDS,
+      so it stays configurable via the existing env var).
+    - max_delay is a ceiling so a huge file can't leave content
+      sitting in a chat indefinitely, defeating the point of
+      auto-delete.
+    """
+
+    if not total_bytes:
+        return min_delay
+
+    estimated_seconds = (
+        total_bytes
+        / (assumed_speed_mbps * 1024 * 1024)
+    ) + buffer_seconds
+
+    return max(
+        min_delay,
+        min(
+            int(estimated_seconds),
+            max_delay
+        )
+    )
+
+
 # ============================================================
 # FORCE SUB
 # ============================================================
@@ -3398,11 +3482,23 @@ async def start_handler(event):
 
                 if found_any:
 
+                    total_size = sum(
+                        (get_file_size(m) or 0)
+                        for m in sent_messages
+                    )
+
+                    delay = auto_delete_delay_for_size(
+                        total_size
+                    )
+
                     warning = await event.reply(
                         "⏳ **SECURITY:** "
                         f"*Videos will auto-delete "
-                        f"in {AUTO_DELETE_SECONDS // 60} "
-                        "minutes.*"
+                        f"in {delay // 60} "
+                        "minutes.*\n\n"
+                        "👉 Forward them to your "
+                        "**Saved Messages** now to "
+                        "keep them."
                     )
 
                     sent_messages.append(
@@ -3412,7 +3508,8 @@ async def start_handler(event):
                     asyncio.create_task(
                         auto_delete_task(
                             event,
-                            sent_messages
+                            sent_messages,
+                            delay=delay
                         )
                     )
 
@@ -3476,11 +3573,18 @@ async def start_handler(event):
                         )
                     )
 
+                    delay = auto_delete_delay_for_size(
+                        get_file_size(sent_file)
+                    )
+
                     warning = await event.reply(
                         "⏳ **SECURITY:** "
                         f"*This video will auto-delete "
-                        f"in {AUTO_DELETE_SECONDS // 60} "
-                        "minutes.*"
+                        f"in {delay // 60} "
+                        "minutes.*\n\n"
+                        "👉 Forward it to your "
+                        "**Saved Messages** now to "
+                        "keep it."
                     )
 
                     asyncio.create_task(
@@ -3489,7 +3593,8 @@ async def start_handler(event):
                             [
                                 sent_file,
                                 warning
-                            ]
+                            ],
+                            delay=delay
                         )
                     )
 
@@ -3714,11 +3819,22 @@ async def request_handler(event):
 
             if found:
 
+                total_size = sum(
+                    (get_file_size(m) or 0)
+                    for m in sent_messages
+                )
+
+                delay = auto_delete_delay_for_size(
+                    total_size
+                )
+
                 warning = await event.reply(
                     "⏳ **SECURITY:** "
                     f"*Videos auto-delete in "
-                    f"{AUTO_DELETE_SECONDS // 60} "
-                    "minutes.*"
+                    f"{delay // 60} minutes.*\n\n"
+                    "👉 Forward them to your "
+                    "**Saved Messages** now to "
+                    "keep them."
                 )
 
                 sent_messages.append(
@@ -3728,7 +3844,8 @@ async def request_handler(event):
                 asyncio.create_task(
                     auto_delete_task(
                         event,
-                        sent_messages
+                        sent_messages,
+                        delay=delay
                     )
                 )
 
