@@ -96,7 +96,7 @@ AUTO_DELETE_SECONDS = max(
     int(
         os.environ.get(
             "AUTO_DELETE_SECONDS",
-            "300"
+            "600"
         )
     )
 )
